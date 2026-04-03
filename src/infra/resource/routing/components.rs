@@ -10,6 +10,7 @@ pub(crate) fn build_stitched_components(
     wires: &WireInterner,
 ) -> StitchedComponentDb {
     let mut bounds_by_node = HashMap::<RouteNode, ComponentBounds>::new();
+    let mut representative_by_node = HashMap::<RouteNode, RouteNode>::new();
     let mut visited = HashSet::<RouteNode>::new();
 
     for tile in arch.tiles.values() {
@@ -36,11 +37,20 @@ pub(crate) fn build_stitched_components(
                 }
             }
 
+            let representative = component
+                .iter()
+                .copied()
+                .min()
+                .expect("stitched component should not be empty");
             for node in component {
                 bounds_by_node.insert(node, bounds);
+                representative_by_node.insert(node, representative);
             }
         }
     }
 
-    StitchedComponentDb { bounds_by_node }
+    StitchedComponentDb {
+        bounds_by_node,
+        representative_by_node,
+    }
 }

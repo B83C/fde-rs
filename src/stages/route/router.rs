@@ -214,7 +214,12 @@ pub fn route_device_design(
 
                 guide_usage.record(guide_mode);
                 reserve_route_sinks(&mut occupied_route_sinks, net_index, net_origin, &path.pips);
-                reserve_route_nodes(&mut occupied_route_nodes, net_index, &path.nodes);
+                reserve_route_nodes(
+                    context.stitched_components,
+                    &mut occupied_route_nodes,
+                    net_index,
+                    &path.nodes,
+                );
                 tree_nodes.extend(path.nodes.iter().copied());
 
                 for pip in path.pips {
@@ -472,6 +477,7 @@ fn route_sink_following_guide(
         |guided| guided.node,
         |state, visit| {
             let availability = NeighborAvailability {
+                stitched_components: context.stitched_components,
                 occupied_route_sinks,
                 occupied_route_nodes,
                 net_index: spec.net_index,
@@ -539,6 +545,7 @@ fn route_sink_with_policy(
         |node| node,
         |state, visit| {
             let availability = NeighborAvailability {
+                stitched_components: context.stitched_components,
                 occupied_route_sinks,
                 occupied_route_nodes,
                 net_index: spec.net_index,
@@ -714,7 +721,10 @@ mod tests {
         domain::NetOrigin,
         resource::{
             ResourceBundle, load_arch,
-            routing::{build_stitched_components, load_site_route_graphs, load_tile_stitch_db},
+            routing::{
+                StitchedComponentDb, build_stitched_components, load_site_route_graphs,
+                load_tile_stitch_db,
+            },
         },
     };
 
@@ -880,13 +890,70 @@ mod tests {
         let site_sink = RouteNode::new(5, 7, wires.intern("S0_F_B1"));
         let occupied = HashMap::from([(track, 0usize), (site_sink, 0usize)]);
         let tree_nodes = HashSet::new();
+        let stitched_components = StitchedComponentDb::default();
 
-        assert!(!route_node_is_available(&occupied, 1, &track, &tree_nodes,));
-        assert!(route_node_is_available(&occupied, 0, &track, &tree_nodes,));
         assert!(!route_node_is_available(
+            &stitched_components,
+            &occupied,
+            1,
+            &track,
+            &tree_nodes,
+        ));
+        assert!(route_node_is_available(
+            &stitched_components,
+            &occupied,
+            0,
+            &track,
+            &tree_nodes,
+        ));
+        assert!(!route_node_is_available(
+            &stitched_components,
             &occupied,
             1,
             &site_sink,
+            &tree_nodes,
+        ));
+    }
+
+    #[test]
+    fn real_arch_stitched_component_occupancy_blocks_shared_llh_track_across_tiles() {
+        let Some(bundle) =
+            ResourceBundle::discover_from(&PathBuf::from(env!("CARGO_MANIFEST_DIR"))).ok()
+        else {
+            return;
+        };
+        let arch_path = bundle.root.join("fdp3p7_arch.xml");
+        if !arch_path.exists() {
+            return;
+        }
+
+        let arch = load_arch(&arch_path).expect("load arch");
+        let mut wires = WireInterner::default();
+        let db = load_tile_stitch_db(&arch_path, &mut wires).expect("load stitch db");
+        let components = build_stitched_components(&db, &arch, &wires);
+
+        let upper = RouteNode::new(4, 53, wires.intern("RIGHT_LLH3"));
+        let lower = RouteNode::new(4, 5, wires.intern("LLH0"));
+        let tree_nodes = HashSet::new();
+
+        assert_eq!(
+            components.occupancy_key(&upper),
+            components.occupancy_key(&lower)
+        );
+
+        let occupied = HashMap::from([(components.occupancy_key(&upper), 0usize)]);
+        assert!(!route_node_is_available(
+            &components,
+            &occupied,
+            1,
+            &lower,
+            &tree_nodes,
+        ));
+        assert!(route_node_is_available(
+            &components,
+            &occupied,
+            0,
+            &lower,
             &tree_nodes,
         ));
     }

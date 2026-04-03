@@ -213,11 +213,19 @@ impl ComponentBounds {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StitchedComponentDb {
     pub(super) bounds_by_node: HashMap<RouteNode, ComponentBounds>,
+    pub(super) representative_by_node: HashMap<RouteNode, RouteNode>,
 }
 
 impl StitchedComponentDb {
     pub(crate) fn bounds(&self, node: &RouteNode) -> Option<ComponentBounds> {
         self.bounds_by_node.get(node).copied()
+    }
+
+    pub(crate) fn occupancy_key(&self, node: &RouteNode) -> RouteNode {
+        self.representative_by_node
+            .get(node)
+            .copied()
+            .unwrap_or(*node)
     }
 }
 

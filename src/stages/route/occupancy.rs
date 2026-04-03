@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::domain::NetOrigin;
+use crate::resource::routing::StitchedComponentDb;
 
 use super::types::{RouteNode, RoutedPip, WireId};
 type RouteWireKey = (usize, usize, WireId);
@@ -37,6 +38,7 @@ pub(super) fn route_sink_is_available(
 }
 
 pub(super) fn route_node_is_available(
+    stitched_components: &StitchedComponentDb,
     occupied_route_nodes: &HashMap<RouteNode, RouteNodeOwner>,
     net_index: usize,
     neighbor: &RouteNode,
@@ -47,7 +49,7 @@ pub(super) fn route_node_is_available(
     }
 
     occupied_route_nodes
-        .get(neighbor)
+        .get(&stitched_components.occupancy_key(neighbor))
         .map(|owner| *owner == net_index)
         .unwrap_or(true)
 }
@@ -70,11 +72,14 @@ pub(super) fn reserve_route_sinks(
 }
 
 pub(super) fn reserve_route_nodes(
+    stitched_components: &StitchedComponentDb,
     occupied_route_nodes: &mut HashMap<RouteNode, RouteNodeOwner>,
     net_index: usize,
     path_nodes: &[RouteNode],
 ) {
     for &node in path_nodes {
-        occupied_route_nodes.entry(node).or_insert(net_index);
+        occupied_route_nodes
+            .entry(stitched_components.occupancy_key(&node))
+            .or_insert(net_index);
     }
 }

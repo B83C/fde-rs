@@ -17,6 +17,7 @@ use super::{
 };
 
 pub(super) struct NeighborAvailability<'a> {
+    pub(super) stitched_components: &'a crate::resource::routing::StitchedComponentDb,
     pub(super) occupied_route_sinks: &'a HashMap<(usize, usize, WireId), RouteSinkOwner>,
     pub(super) occupied_route_nodes: &'a HashMap<RouteNode, RouteNodeOwner>,
     pub(super) net_index: usize,
@@ -31,6 +32,7 @@ pub(super) fn neighbor_is_available(
     local_arc: Option<usize>,
 ) -> bool {
     route_node_is_available(
+        availability.stitched_components,
         availability.occupied_route_nodes,
         availability.net_index,
         neighbor,

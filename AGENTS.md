@@ -402,6 +402,53 @@ P77 versions of:
 If new live-board mismatches remain, treat them as fresh cases and compare against a
 fresh C++ probe first instead of assuming they share the old FF root cause.
 
+### Update (2026-04-03): `logic-mesh` Rust-only route bug fixed
+
+After re-filtering against a freshly runnable current C++ full chain, the only
+remaining true "C++ correct, Rust wrong" board case was:
+
+- `logic-mesh`
+
+Fresh current C++ invocation details that worked:
+
+- `map` must include `-y`
+- `pack` must include `-g resources/hw_lib/fdp3_config.xml`
+
+Root cause:
+
+- Rust route occupancy only reserved exact `(x, y, wire)` nodes.
+- That was insufficient for inter-tile stitched wires, where multiple tile-local
+  names are really the same physical conductor.
+- In `logic-mesh`, Rust allowed `net_Buf-pad-a` and `net_Buf-pad-y1` to both claim
+  the same stitched LLH component even though their tile-local nodes differed.
+- The decisive aliases on the real arch were on the same stitched LLH component,
+  for example:
+  - `RIGHT_LLH3 @ (4,53)`
+  - `LLH6 @ (4,24)`
+  - `LLH0 @ (4,5)`
+
+What changed in Rust:
+
+- `StitchedComponentDb` now records a canonical representative per stitched
+  component in addition to bounds.
+- Route-node occupancy now reserves and checks that canonical stitched-component
+  key instead of only the exact tile-local node.
+
+Verification:
+
+- `cargo test --lib all_route_nodes_are_reserved_across_nets -- --nocapture`
+- `cargo test --lib real_arch_stitched_component_occupancy_blocks_shared_llh_track_across_tiles -- --nocapture`
+- `python3 scripts/board_e2e.py run logic-mesh --out-root build/board-e2e-logic-mesh-stitched-occ-20260403`
+
+Result:
+
+- `logic-mesh` now matches the correct board sequence:
+  `0x8,0xc,0xd,0xc,0x8,0xb,0x8,0xc,0xd,0xc,0xc,0xd,0xc,0x8`
+- In the fixed Rust route, `net_Buf-pad-y1` stayed on its prior path, while
+  `net_Buf-pad-a` was rerouted off the conflicting stitched LLH resource.
+- At this checkpoint, the previously filtered set of "C++ correct, Rust wrong"
+  board cases is empty.
+
 ### `add16-folded-check` root cause that has now been confirmed
 
 `add16-folded-check` was not a slice-config reconstruction bug.
@@ -533,19 +580,14 @@ first debugging loop.
 
 ### Recommended next steps for the next contributor
 
-1. Reconfirm the true C++ baseline for:
-   - `ff-data-check`
-   - `ff-slot1-check`
-   - `ff-shift2-check`
-   - `ff-clock-check`
-2. If needed, regenerate or freshly probe C++ outputs from `../FDE-Source` rather
-   than relying on `manifest.json`.
-3. Compare route/site-route materialization for the same cases and same placement:
-   - inspect `04-routed.xml` route pips first;
-   - if needed, reconstruct the route image through `src/stages/route/image.rs`
-     and inspect site-level arcs and generated route bits;
-   - verify that the named sidecar arcs correspond to the same physical
-     programmable arc and SRAM bits.
+1. If new board mismatches appear, first re-run the same filter discipline:
+   - freshly probe current C++ on the exact case;
+   - keep only cases where current C++ is correct and Rust is wrong.
+2. For any new Rust-only route bug, check stitched-wire ownership early instead of
+   only exact route-node ownership.
+3. Use the known-good current C++ full-chain invocation:
+   - `map -y`
+   - `pack ... -g resources/hw_lib/fdp3_config.xml`
 4. Do not spend more time on `SYNCX/SYNCY` or safe-default slice mux theories unless
    new evidence appears.
 5. Only update `examples/board-e2e/manifest.json` after the C++ baseline is freshly
