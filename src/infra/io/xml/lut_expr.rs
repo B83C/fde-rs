@@ -82,7 +82,7 @@ pub(super) fn decode_lut_function(value: &str) -> Option<(String, usize)> {
         return None;
     }
     if let Some(expr) = value.strip_prefix("#LUT:D=") {
-        return decode_lut_expression(expr);
+        return decode_lut_expression(expr).or_else(|| decode_lut_literal(expr));
     }
     decode_lut_literal(value)
 }
@@ -208,6 +208,12 @@ mod tests {
             decode_lut_function("#LUT:D=((A3*~A2)*~A1)+((~A3*A2)*~A1)"),
             Some(("0x14".to_string(), 3))
         );
+    }
+
+    #[test]
+    fn decodes_constant_expression_literals_emitted_by_cpp_physical_xml() {
+        assert_eq!(decode_lut_function("#LUT:D=0"), Some(("0x0".to_string(), 4)));
+        assert_eq!(decode_lut_function("#LUT:D=1"), Some(("0x1".to_string(), 4)));
     }
 
     #[test]

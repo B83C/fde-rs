@@ -46,7 +46,7 @@ pub(super) fn load_fde_physical_design_xml(root: Node<'_, '_>) -> Result<Design>
     let mut ports = module_node
         .children()
         .filter(|node| node.has_tag_name("port"))
-        .map(physical_port)
+        .flat_map(physical_ports)
         .collect::<Vec<_>>();
     let port_names = ports
         .iter()
@@ -173,29 +173,61 @@ pub(super) fn load_fde_physical_design_xml(root: Node<'_, '_>) -> Result<Design>
     })
 }
 
-fn physical_port(node: Node<'_, '_>) -> Port {
-    let mut port = Port::new(
-        attr(&node, "name"),
-        attr(&node, "direction")
-            .parse()
-            .unwrap_or(PortDirection::Input),
-    );
-    for property in node.children().filter(|child| child.has_tag_name("property")) {
-        let Some(value) = property.attribute("value") else {
-            continue;
-        };
-        match property.attribute("name") {
-            Some("fde_pin") => port.pin = Some(value.to_string()),
-            Some("fde_position") => {
-                if let Some((x, y, _)) = parse_point(value) {
-                    port.x = Some(x);
-                    port.y = Some(y);
+fn physical_ports(node: Node<'_, '_>) -> Vec<Port> {
+    let direction = attr(&node, "direction")
+        .parse()
+        .unwrap_or(PortDirection::Input);
+    let names = expanded_physical_port_names(node);
+    names
+        .into_iter()
+        .map(|name| {
+            let mut port = Port::new(name, direction.clone());
+            port.width = 1;
+            for property in node
+                .children()
+                .filter(|child| child.has_tag_name("property"))
+            {
+                let Some(value) = property.attribute("value") else {
+                    continue;
+                };
+                match property.attribute("name") {
+                    Some("fde_pin") => port.pin = Some(value.to_string()),
+                    Some("fde_position") => {
+                        if let Some((x, y, _)) = parse_point(value) {
+                            port.x = Some(x);
+                            port.y = Some(y);
+                        }
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
-        }
+            port
+        })
+        .collect()
+}
+
+fn expanded_physical_port_names(node: Node<'_, '_>) -> Vec<String> {
+    let name = attr(&node, "name");
+    let Some(msb) = node
+        .attribute("msb")
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return vec![name];
+    };
+    let lsb = node
+        .attribute("lsb")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(msb);
+    if msb >= lsb {
+        (lsb..=msb)
+            .rev()
+            .map(|index| format!("{name}[{index}]"))
+            .collect()
+    } else {
+        (msb..=lsb)
+            .map(|index| format!("{name}[{index}]"))
+            .collect()
     }
-    port
 }
 
 fn top_module_node<'a, 'input>(root: Node<'a, 'input>) -> Result<Node<'a, 'input>> {
@@ -911,5 +943,148 @@ mod tests {
             .expect("clk port");
         assert_eq!(clk.pin.as_deref(), Some("P77"));
         assert_eq!((clk.x, clk.y, clk.z), (Some(34), Some(27), Some(1)));
+    }
+
+    #[test]
+    fn physical_import_expands_cpp_bus_ports_into_bit_ports() {
+        let xml = r##"
+<design name="bus_import">
+  <external name="template_work_lib">
+    <module name="iob" type="IOB">
+      <port name="OUT" direction="input" capacitance="0.00000"/>
+      <port name="PAD" direction="inout" capacitance="0.00000"/>
+    </module>
+  </external>
+  <library name="work_lib">
+    <module name="bus_import" type="GENERIC">
+      <port name="led" msb="1" lsb="0" direction="output" capacitance="0.00000"/>
+      <contents>
+        <instance name="led[1]" moduleRef="iob" libraryRef="template_work_lib">
+          <property name="position" type="point" value="5,1,3"/>
+        </instance>
+        <instance name="led[0]" moduleRef="iob" libraryRef="template_work_lib">
+          <property name="position" type="point" value="5,1,2"/>
+        </instance>
+        <net name="net_Buf-pad-led[1]">
+          <portRef name="OUT" instanceRef="led[1]"/>
+          <portRef name="led[1]"/>
+        </net>
+        <net name="led[1]">
+          <portRef name="PAD" instanceRef="led[1]"/>
+          <portRef name="led[1]"/>
+        </net>
+        <net name="net_Buf-pad-led[0]">
+          <portRef name="OUT" instanceRef="led[0]"/>
+          <portRef name="led[0]"/>
+        </net>
+        <net name="led[0]">
+          <portRef name="PAD" instanceRef="led[0]"/>
+          <portRef name="led[0]"/>
+        </net>
+      </contents>
+    </module>
+  </library>
+  <topModule libraryRef="work_lib" name="bus_import"/>
+</design>
+"##;
+
+        let document = roxmltree::Document::parse(xml).expect("physical XML should parse");
+        let design = load_fde_physical_design_xml(document.root_element())
+            .expect("physical import should succeed");
+
+        let port_names = design
+            .ports
+            .iter()
+            .map(|port| port.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(port_names, vec!["led[1]", "led[0]"]);
+
+        let led1 = design
+            .ports
+            .iter()
+            .find(|port| port.name == "led[1]")
+            .expect("led[1] port");
+        assert_eq!((led1.x, led1.y, led1.z), (Some(5), Some(1), Some(3)));
+
+        let led0 = design
+            .ports
+            .iter()
+            .find(|port| port.name == "led[0]")
+            .expect("led[0] port");
+        assert_eq!((led0.x, led0.y, led0.z), (Some(5), Some(1), Some(2)));
+
+        let net_names = design
+            .nets
+            .iter()
+            .map(|net| net.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(net_names.contains(&"led[1]"));
+        assert!(net_names.contains(&"led[0]"));
+    }
+
+    #[test]
+    fn physical_import_preserves_cpp_constant_zero_lut_outputs() {
+        let xml = r##"
+<design name="const_zero_lut">
+  <external name="template_work_lib">
+    <module name="slice" type="SLICE">
+      <port name="Y" direction="output" capacitance="0.00000"/>
+    </module>
+    <module name="iob" type="IOB">
+      <port name="OUT" direction="input" capacitance="0.00000"/>
+      <port name="PAD" direction="inout" capacitance="0.00000"/>
+    </module>
+  </external>
+  <library name="work_lib">
+    <module name="const_zero_lut" type="GENERIC">
+      <port name="led" direction="output" capacitance="0.00000"/>
+      <contents>
+        <instance name="iSlice__0__" moduleRef="slice" libraryRef="template_work_lib">
+          <property name="position" type="point" value="27,23,0"/>
+          <config name="F" value="#OFF"/>
+          <config name="G" value="#LUT:D=0"/>
+          <config name="FXMUX" value="#OFF"/>
+          <config name="GYMUX" value="G"/>
+          <config name="XUSED" value="#OFF"/>
+          <config name="YUSED" value="0"/>
+        </instance>
+        <instance name="led" moduleRef="iob" libraryRef="template_work_lib">
+          <property name="position" type="point" value="34,30,1"/>
+        </instance>
+        <net name="net_Buf-pad-led">
+          <portRef name="Y" instanceRef="iSlice__0__"/>
+          <portRef name="OUT" instanceRef="led"/>
+          <pip from="S0_Y" to="OUT3" position="27,23" dir="-&gt;"/>
+        </net>
+        <net name="led">
+          <portRef name="PAD" instanceRef="led"/>
+          <portRef name="led"/>
+        </net>
+      </contents>
+    </module>
+  </library>
+  <topModule libraryRef="work_lib" name="const_zero_lut"/>
+</design>
+"##;
+
+        let document = roxmltree::Document::parse(xml).expect("physical XML should parse");
+        let design = load_fde_physical_design_xml(document.root_element())
+            .expect("physical import should succeed");
+
+        assert!(
+            design
+                .cells
+                .iter()
+                .any(|cell| cell.name == "iSlice__0__::lut1" && cell.property("lut_init") == Some("0x0"))
+        );
+        let led_net = design
+            .nets
+            .iter()
+            .find(|net| net.name == "led")
+            .expect("logical led net");
+        assert_eq!(
+            led_net.driver.as_ref().map(|endpoint| endpoint.name.as_str()),
+            Some("iSlice__0__::lut1")
+        );
     }
 }

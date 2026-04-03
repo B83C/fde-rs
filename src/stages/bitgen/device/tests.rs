@@ -2,7 +2,11 @@ use crate::{
     bitgen::{BitgenOptions, run as run_bitgen},
     cil::load_cil,
     constraints::load_constraints,
-    domain::{NetOrigin, SiteKind},
+    domain::{
+        NetOrigin, SiteKind, is_clock_distribution_wire_name, is_clock_sink_wire_name,
+        is_directional_channel_wire_name, is_hex_like_wire_name, is_long_wire_name,
+        is_pad_stub_wire_name,
+    },
     ir::{Cell, Cluster, Design, Endpoint, Net, RoutePip, RouteSegment},
     map::{MapOptions, load_input, run as run_map},
     pack::{PackOptions, run as run_pack},
@@ -295,7 +299,7 @@ fn exact_clock_routing_connects_gclk_pad_into_global_buffer_when_resources_are_a
 }
 
 #[test]
-fn exact_logical_clock_routing_stays_on_dedicated_global_spine_when_resources_are_available()
+fn exact_logical_clock_routing_uses_cpp_compatible_clock_branch_wires_when_needed()
 -> Result<()> {
     let Some(bundle) = crate::resource::ResourceBundle::discover_from(&repo_root()).ok() else {
         return Ok(());
@@ -353,7 +357,6 @@ fn exact_logical_clock_routing_stays_on_dedicated_global_spine_when_resources_ar
         })
         .expect("logical clock net");
     let expected_from = format!("{}_GCLK{}_PW", gclk.tile_wire_prefix(), gclk.z);
-    let expected_to = format!("{}_GCLK{}", gclk.tile_wire_prefix(), gclk.z);
 
     let route_image = crate::route::route_device_design(&lowered, &arch, &arch_path, &cil)?;
     let logical_clock_pips = route_image
@@ -365,20 +368,32 @@ fn exact_logical_clock_routing_stays_on_dedicated_global_spine_when_resources_ar
     assert!(
         logical_clock_pips
             .iter()
-            .any(|pip| pip.from_net == expected_from && pip.to_net == expected_to)
+            .any(|pip| { pip.from_net == expected_from && clock_route_or_sink_wire(&pip.to_net) })
     );
     assert!(
         logical_clock_pips
             .iter()
-            .any(|pip| { pip.from_net.contains("GCLK") && pip.to_net == "S0_CLK_B" })
+            .any(|pip| { clock_route_wire(&pip.from_net) && is_clock_sink_wire_name(&pip.to_net) })
     );
     assert!(
         logical_clock_pips
             .iter()
-            .all(|pip| { pip.to_net.contains("GCLK") || pip.to_net == "S0_CLK_B" })
+            .all(|pip| clock_route_or_sink_wire(&pip.to_net))
     );
 
     Ok(())
+}
+
+fn clock_route_wire(raw: &str) -> bool {
+    is_clock_distribution_wire_name(raw)
+        || is_long_wire_name(raw)
+        || is_hex_like_wire_name(raw)
+        || is_directional_channel_wire_name(raw)
+        || is_pad_stub_wire_name(raw)
+}
+
+fn clock_route_or_sink_wire(raw: &str) -> bool {
+    clock_route_wire(raw) || is_clock_sink_wire_name(raw)
 }
 
 #[test]

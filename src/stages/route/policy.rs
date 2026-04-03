@@ -3,7 +3,11 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     DeviceCell,
-    domain::{NetOrigin, SiteKind, is_clock_sink_wire_name, is_dedicated_clock_wire_name},
+    domain::{
+        NetOrigin, SiteKind, is_clock_distribution_wire_name, is_clock_sink_wire_name,
+        is_directional_channel_wire_name, is_hex_like_wire_name, is_long_wire_name,
+        is_pad_stub_wire_name,
+    },
     resource::routing::stitched_neighbors,
     route::{
         lookup::{TileRouteContext, route_context_for_node},
@@ -130,11 +134,26 @@ pub(super) fn allow_clock_neighbor(
         return true;
     }
 
-    if is_clock_sink_wire_name(next_name) {
-        return is_dedicated_clock_wire_name(current_name);
+    if !is_clock_route_wire_name(current_name) {
+        return false;
     }
 
-    is_dedicated_clock_wire_name(current_name) && is_dedicated_clock_wire_name(next_name)
+    if is_clock_sink_wire_name(next_name) {
+        return true;
+    }
+
+    is_clock_route_wire_name(next_name)
+}
+
+fn is_clock_route_wire_name(raw: &str) -> bool {
+    // C++ routed dedicated clocks do not stay on GCLK-only wires. Real baseline
+    // paths fan out through LLH/H6/V6/channel/pad-stub branches before entering
+    // *_CLK_B sinks, so the legality filter must accept those branch families.
+    is_clock_distribution_wire_name(raw)
+        || is_long_wire_name(raw)
+        || is_hex_like_wire_name(raw)
+        || is_directional_channel_wire_name(raw)
+        || is_pad_stub_wire_name(raw)
 }
 
 pub(super) fn should_skip_local_arc(
@@ -225,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_clock_sink_keeps_cxx_clock_spine_available() {
+    fn strict_clock_sink_keeps_cpp_clock_branch_wires_available() {
         assert!(allow_clock_neighbor(
             RouteNetKind::DedicatedClock,
             true,
@@ -250,17 +269,35 @@ mod tests {
             "GCLK1",
             "S0_CLK_B",
         ));
-        assert!(!allow_clock_neighbor(
+        assert!(allow_clock_neighbor(
             RouteNetKind::DedicatedClock,
             true,
             "CLKB_GCLK1_PW",
             "CLKB_LLH1",
         ));
-        assert!(!allow_clock_neighbor(
+        assert!(allow_clock_neighbor(
             RouteNetKind::DedicatedClock,
             true,
             "GCLK1",
             "W_P16",
+        ));
+        assert!(allow_clock_neighbor(
+            RouteNetKind::DedicatedClock,
+            true,
+            "V6N2",
+            "S0_CLK_B",
+        ));
+        assert!(allow_clock_neighbor(
+            RouteNetKind::DedicatedClock,
+            true,
+            "E_P15",
+            "S0_CLK_B",
+        ));
+        assert!(!allow_clock_neighbor(
+            RouteNetKind::DedicatedClock,
+            true,
+            "OUT4",
+            "S0_CLK_B",
         ));
     }
 
