@@ -60,7 +60,6 @@ pub(crate) fn prepare_bitgen(
             cil,
             device_design,
             route_image,
-            ..BitgenOptions::default()
         },
     })
 }

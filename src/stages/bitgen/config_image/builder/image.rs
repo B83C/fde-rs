@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::accumulator::TileAccumulator;
 use super::super::{ConfigImage, TileBitAssignment};
-use super::target::TargetAssignment;
+use super::target::{SourceTileContext, TargetAssignment};
 
 pub(super) struct ConfigImageBuilder {
     notes: Vec<String>,
@@ -30,23 +30,25 @@ impl ConfigImageBuilder {
 
     pub(super) fn register_config(
         &mut self,
-        tile_name: &str,
-        tile_type: &str,
-        x: usize,
-        y: usize,
-        rows: usize,
-        cols: usize,
+        source: SourceTileContext<'_>,
         site_name: &str,
         cfg_name: &str,
         function_name: &str,
     ) {
-        self.tile_mut(tile_name, tile_type, x, y, rows, cols)
-            .configs_mut()
-            .insert((
-                site_name.to_string(),
-                cfg_name.to_string(),
-                function_name.to_string(),
-            ));
+        self.tile_mut(
+            source.tile_name,
+            source.tile_type,
+            source.x,
+            source.y,
+            source.rows,
+            source.cols,
+        )
+        .configs_mut()
+        .insert((
+            site_name.to_string(),
+            cfg_name.to_string(),
+            function_name.to_string(),
+        ));
     }
 
     pub(super) fn insert_assignment(

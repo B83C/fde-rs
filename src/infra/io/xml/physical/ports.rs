@@ -1,4 +1,7 @@
-use crate::{ir::{Design, RoutePip}, resource::PadSiteKind};
+use crate::{
+    ir::{Design, RoutePip},
+    resource::PadSiteKind,
+};
 
 use super::super::writer::{
     GCLKIOB_DEFAULT_CONFIGS, IOB_DEFAULT_CONFIGS, PortInstanceBinding, XmlWriteContext,

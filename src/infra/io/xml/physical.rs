@@ -13,7 +13,10 @@ use ports::{build_pad_configs, build_port_bindings};
 
 impl PhysicalDesignView {
     pub(super) fn build(design: &Design, context: &XmlWriteContext<'_>) -> Option<Self> {
-        if !matches!(design.stage.as_str(), "packed" | "placed" | "routed" | "timed") {
+        if !matches!(
+            design.stage.as_str(),
+            "packed" | "placed" | "routed" | "timed"
+        ) {
             return None;
         }
         if design
@@ -87,7 +90,9 @@ impl PhysicalDesignView {
                         position: (design.stage != "packed")
                             .then_some(binding.gclk_position)
                             .flatten(),
-                        configs: super::writer::default_configs(super::writer::GCLK_DEFAULT_CONFIGS),
+                        configs: super::writer::default_configs(
+                            super::writer::GCLK_DEFAULT_CONFIGS,
+                        ),
                     })
             })
             .collect::<Vec<_>>();

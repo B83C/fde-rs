@@ -64,7 +64,7 @@ pub(super) fn encode_lut_expression_literal(bits: &[u8], input_count: usize) -> 
     let mut term_number = 1usize;
     let start_mask = if term_index == 0 { 0b0010 } else { 0b1000 };
     for digit in hex_digits.bytes() {
-        let mut value = (digit & 0x0f) as u8;
+        let mut value = digit & 0x0f;
         if digit > b'9' {
             value += 9;
         }
@@ -103,7 +103,10 @@ fn decode_lut_expression(expr: &str) -> Option<(String, usize)> {
     for (term_index, terms) in LUT_EXPR_TERMS.iter().enumerate() {
         let input_count = term_index + 1;
         if expr == terms[0] {
-            return Some((format_truth_table_literal(&vec![0; 1usize << input_count]), input_count));
+            return Some((
+                format_truth_table_literal(&vec![0; 1usize << input_count]),
+                input_count,
+            ));
         }
         let tokens = expr
             .split('+')
@@ -130,9 +133,15 @@ fn decode_lut_expression(expr: &str) -> Option<(String, usize)> {
 }
 
 fn decode_lut_literal(value: &str) -> Option<(String, usize)> {
-    let bit_width = if let Some(digits) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+    let bit_width = if let Some(digits) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
         digits.len().max(1) * 4
-    } else if let Some(digits) = value.strip_prefix("0b").or_else(|| value.strip_prefix("0B")) {
+    } else if let Some(digits) = value
+        .strip_prefix("0b")
+        .or_else(|| value.strip_prefix("0B"))
+    {
         digits.len().max(1)
     } else if value.contains('\'') {
         let (_, suffix) = value.split_once('\'')?;
@@ -190,7 +199,10 @@ mod tests {
     #[test]
     fn decodes_literal_forms() {
         assert_eq!(decode_lut_function("0xC"), Some(("0xC".to_string(), 2)));
-        assert_eq!(decode_lut_function("16'h8000"), Some(("0x8000".to_string(), 4)));
+        assert_eq!(
+            decode_lut_function("16'h8000"),
+            Some(("0x8000".to_string(), 4))
+        );
     }
 
     #[test]

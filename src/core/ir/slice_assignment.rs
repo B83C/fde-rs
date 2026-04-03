@@ -55,7 +55,11 @@ fn authoritative_cluster_assignments(
         used.insert(cell_id);
     }
 
-    let mut next_slot = assigned.iter().map(|cell| cell.slot).max().map_or(0, |slot| slot + 1);
+    let mut next_slot = assigned
+        .iter()
+        .map(|cell| cell.slot)
+        .max()
+        .map_or(0, |slot| slot + 1);
     for &cell_id in index.cluster_members(cluster_id) {
         if used.contains(&cell_id) {
             continue;
@@ -63,7 +67,8 @@ fn authoritative_cluster_assignments(
         assigned.push(AssignedClusterCell {
             cell_id,
             slot: next_slot,
-            kind: assigned_kind(index.cell(design, cell_id)).unwrap_or(AssignedClusterCellKind::Other),
+            kind: assigned_kind(index.cell(design, cell_id))
+                .unwrap_or(AssignedClusterCellKind::Other),
         });
         next_slot += 1;
     }
@@ -118,7 +123,8 @@ fn heuristic_cluster_assignments(
         assigned.push(AssignedClusterCell {
             cell_id,
             slot,
-            kind: assigned_kind(index.cell(design, cell_id)).unwrap_or(AssignedClusterCellKind::Other),
+            kind: assigned_kind(index.cell(design, cell_id))
+                .unwrap_or(AssignedClusterCellKind::Other),
         });
         used.insert(cell_id);
         slot += 1;
@@ -150,22 +156,28 @@ fn lut_feeding_ff(
         .find(|pin| pin.port.eq_ignore_ascii_case("D"))?
         .net
         .as_str();
-    index.cluster_members(cluster_id).iter().find_map(|cell_id| {
-        let cell = index.cell(design, *cell_id);
-        if !cell.is_lut() {
-            return None;
-        }
-        cell.outputs
-            .iter()
-            .any(|pin| pin.net == d_net)
-            .then_some(*cell_id)
-    })
+    index
+        .cluster_members(cluster_id)
+        .iter()
+        .find_map(|cell_id| {
+            let cell = index.cell(design, *cell_id);
+            if !cell.is_lut() {
+                return None;
+            }
+            cell.outputs
+                .iter()
+                .any(|pin| pin.net == d_net)
+                .then_some(*cell_id)
+        })
 }
 
 fn sort_assigned_cells(assigned: &mut [AssignedClusterCell]) {
     assigned.sort_by(|lhs, rhs| {
-        (lhs.slot, kind_sort_key(lhs.kind), lhs.cell_id.index())
-            .cmp(&(rhs.slot, kind_sort_key(rhs.kind), rhs.cell_id.index()))
+        (lhs.slot, kind_sort_key(lhs.kind), lhs.cell_id.index()).cmp(&(
+            rhs.slot,
+            kind_sort_key(rhs.kind),
+            rhs.cell_id.index(),
+        ))
     });
 }
 

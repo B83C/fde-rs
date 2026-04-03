@@ -1,9 +1,7 @@
 use super::{helpers::attr, lut_expr::decode_lut_function};
-use crate::{
-    ir::{
-        Cell, Cluster, Design, Endpoint, Net, Port, PortDirection, RoutePip, RouteSegment,
-        SliceBindingKind,
-    },
+use crate::ir::{
+    Cell, Cluster, Design, Endpoint, Net, Port, PortDirection, RoutePip, RouteSegment,
+    SliceBindingKind,
 };
 use anyhow::{Result, anyhow};
 use roxmltree::Node;
@@ -92,7 +90,9 @@ pub(super) fn load_fde_physical_design_xml(root: Node<'_, '_>) -> Result<Design>
         slice_states.insert(instance.name.clone(), slice_state);
     }
 
-    clusters.sort_by(|lhs, rhs| slice_instance_sort_key(&lhs.name).cmp(&slice_instance_sort_key(&rhs.name)));
+    clusters.sort_by(|lhs, rhs| {
+        slice_instance_sort_key(&lhs.name).cmp(&slice_instance_sort_key(&rhs.name))
+    });
 
     let mut nets = Vec::new();
     for net in contents.children().filter(|node| node.has_tag_name("net")) {
@@ -281,10 +281,7 @@ fn clock_bridge_route_pips(
     pips_by_port
 }
 
-fn apply_port_positions(
-    ports: &mut [Port],
-    instances_by_name: &BTreeMap<&str, &PhysicalInstance>,
-) {
+fn apply_port_positions(ports: &mut [Port], instances_by_name: &BTreeMap<&str, &PhysicalInstance>) {
     for port in ports {
         let Some(instance) = instances_by_name.get(port.name.as_str()).copied() else {
             continue;
@@ -340,7 +337,11 @@ fn build_slice_cluster(instance: &PhysicalInstance) -> (Cluster, Vec<Cell>, Slic
             .with_slice_binding(slot, SliceBindingKind::Sequential);
         members.push(ff_name.clone());
         state.slots[slot].ff_name = Some(ff_name);
-        state.slots[slot].ff_clock_pin = if instance.configs.get("CKINV").is_some_and(|value| value == "1") {
+        state.slots[slot].ff_clock_pin = if instance
+            .configs
+            .get("CKINV")
+            .is_some_and(|value| value == "1")
+        {
             "CKN".to_string()
         } else {
             "CK".to_string()
@@ -407,35 +408,61 @@ fn slice_logical_endpoints(
         "X" => state.slots[0]
             .lut_name
             .as_ref()
-            .map(|name| vec![(Endpoint::cell(name.clone(), "O"), PhysicalEndpointRole::Driver)])
+            .map(|name| {
+                vec![(
+                    Endpoint::cell(name.clone(), "O"),
+                    PhysicalEndpointRole::Driver,
+                )]
+            })
             .unwrap_or_default(),
         "Y" => state.slots[1]
             .lut_name
             .as_ref()
-            .map(|name| vec![(Endpoint::cell(name.clone(), "O"), PhysicalEndpointRole::Driver)])
+            .map(|name| {
+                vec![(
+                    Endpoint::cell(name.clone(), "O"),
+                    PhysicalEndpointRole::Driver,
+                )]
+            })
             .unwrap_or_default(),
         "XQ" => state.slots[0]
             .ff_name
             .as_ref()
-            .map(|name| vec![(Endpoint::cell(name.clone(), "Q"), PhysicalEndpointRole::Driver)])
+            .map(|name| {
+                vec![(
+                    Endpoint::cell(name.clone(), "Q"),
+                    PhysicalEndpointRole::Driver,
+                )]
+            })
             .unwrap_or_default(),
         "YQ" => state.slots[1]
             .ff_name
             .as_ref()
-            .map(|name| vec![(Endpoint::cell(name.clone(), "Q"), PhysicalEndpointRole::Driver)])
+            .map(|name| {
+                vec![(
+                    Endpoint::cell(name.clone(), "Q"),
+                    PhysicalEndpointRole::Driver,
+                )]
+            })
             .unwrap_or_default(),
         "CLK" => ff_control_endpoints(&state.slots, |slot| {
-            slot.ff_name.as_ref().map(|name| {
-                Endpoint::cell(name.clone(), slot.ff_clock_pin.clone())
-            })
+            slot.ff_name
+                .as_ref()
+                .map(|name| Endpoint::cell(name.clone(), slot.ff_clock_pin.clone()))
         }),
         "CE" => ff_control_endpoints(&state.slots, |slot| {
             (slot.ff_has_clock_enable)
-                .then(|| slot.ff_name.as_ref().map(|name| Endpoint::cell(name.clone(), "E")))
+                .then(|| {
+                    slot.ff_name
+                        .as_ref()
+                        .map(|name| Endpoint::cell(name.clone(), "E"))
+                })
                 .flatten()
         }),
         "SR" => ff_control_endpoints(&state.slots, |slot| {
-            slot.ff_name.as_ref().map(|name| Endpoint::cell(name.clone(), "RN"))
+            slot.ff_name
+                .as_ref()
+                .map(|name| Endpoint::cell(name.clone(), "RN"))
         }),
         "BX" => ff_bypass_endpoint(&state.slots[0]),
         "BY" => ff_bypass_endpoint(&state.slots[1]),
@@ -459,7 +486,12 @@ fn ff_bypass_endpoint(slot: &SliceSlotState) -> Vec<(Endpoint, PhysicalEndpointR
     }
     slot.ff_name
         .as_ref()
-        .map(|name| vec![(Endpoint::cell(name.clone(), "D"), PhysicalEndpointRole::Sink)])
+        .map(|name| {
+            vec![(
+                Endpoint::cell(name.clone(), "D"),
+                PhysicalEndpointRole::Sink,
+            )]
+        })
         .unwrap_or_default()
 }
 
@@ -490,7 +522,11 @@ fn lut_input_endpoint(
         .unwrap_or_default()
 }
 
-fn port_logical_endpoints(instance_name: &str, pin: &str, ports: &[Port]) -> Vec<(Endpoint, PhysicalEndpointRole)> {
+fn port_logical_endpoints(
+    instance_name: &str,
+    pin: &str,
+    ports: &[Port],
+) -> Vec<(Endpoint, PhysicalEndpointRole)> {
     let Some(port) = ports.iter().find(|port| port.name == instance_name) else {
         return Vec::new();
     };
@@ -514,8 +550,11 @@ fn is_pad_connection_net(name: &str, port_names: &BTreeSet<String>) -> bool {
 }
 
 fn is_clock_bridge_net(name: &str, clock_buffer_ports: &BTreeMap<String, String>) -> bool {
-    name.strip_prefix("net_Buf-pad-")
-        .is_some_and(|port_name| clock_buffer_ports.values().any(|candidate| candidate == port_name))
+    name.strip_prefix("net_Buf-pad-").is_some_and(|port_name| {
+        clock_buffer_ports
+            .values()
+            .any(|candidate| candidate == port_name)
+    })
 }
 
 fn logical_net_name<'a>(physical_name: &'a str, port_names: &BTreeSet<String>) -> &'a str {
@@ -574,8 +613,15 @@ fn attach_cell_pins(cells: &mut [Cell], nets: &[Net]) {
             && let Some(&cell_index) = cells_by_name.get(&driver.name)
         {
             let cell = &mut cells[cell_index];
-            if !cell.outputs.iter().any(|pin| pin.port == driver.pin && pin.net == net.name) {
-                cell.outputs.push(crate::ir::CellPin::new(driver.pin.clone(), net.name.clone()));
+            if !cell
+                .outputs
+                .iter()
+                .any(|pin| pin.port == driver.pin && pin.net == net.name)
+            {
+                cell.outputs.push(crate::ir::CellPin::new(
+                    driver.pin.clone(),
+                    net.name.clone(),
+                ));
             }
         }
         for sink in &net.sinks {
@@ -586,8 +632,13 @@ fn attach_cell_pins(cells: &mut [Cell], nets: &[Net]) {
                 continue;
             };
             let cell = &mut cells[cell_index];
-            if !cell.inputs.iter().any(|pin| pin.port == sink.pin && pin.net == net.name) {
-                cell.inputs.push(crate::ir::CellPin::new(sink.pin.clone(), net.name.clone()));
+            if !cell
+                .inputs
+                .iter()
+                .any(|pin| pin.port == sink.pin && pin.net == net.name)
+            {
+                cell.inputs
+                    .push(crate::ir::CellPin::new(sink.pin.clone(), net.name.clone()));
             }
         }
     }
@@ -680,7 +731,10 @@ fn parse_point(value: &str) -> Option<(usize, usize, usize)> {
 }
 
 fn push_unique_endpoint(endpoints: &mut Vec<Endpoint>, endpoint: Endpoint) {
-    if endpoints.iter().any(|existing| existing.key() == endpoint.key()) {
+    if endpoints
+        .iter()
+        .any(|existing| existing.key() == endpoint.key())
+    {
         return;
     }
     endpoints.push(endpoint);
@@ -742,8 +796,8 @@ mod tests {
 "##;
 
         let document = roxmltree::Document::parse(xml).expect("physical XML should parse");
-        let design =
-            load_fde_physical_design_xml(document.root_element()).expect("physical import should succeed");
+        let design = load_fde_physical_design_xml(document.root_element())
+            .expect("physical import should succeed");
         let clock_net = design
             .nets
             .iter()
@@ -757,9 +811,6 @@ mod tests {
                 RoutePip::new((34, 27), "CLKB_GCLK1_PW", "CLKB_GCLK1"),
             ]
         );
-        assert_eq!(
-            clock_net.route,
-            vec![RouteSegment::new((34, 27), (34, 27))]
-        );
+        assert_eq!(clock_net.route, vec![RouteSegment::new((34, 27), (34, 27))]);
     }
 }

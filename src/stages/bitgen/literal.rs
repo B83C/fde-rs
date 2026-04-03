@@ -101,12 +101,11 @@ pub(crate) fn parse_compact_hex_digit_literal(raw: &str, width: usize) -> Option
 }
 
 fn widen_truth_table_bits(bits: &[u8], width: usize) -> Option<Vec<u8>> {
-    if bits.is_empty() || width == 0 || width % bits.len() != 0 {
+    if bits.is_empty() || width == 0 || !width.is_multiple_of(bits.len()) {
         return None;
     }
     Some(bits.iter().copied().cycle().take(width).collect())
 }
-
 
 fn logical_truth_table_bits(primitive: PrimitiveKind) -> Option<usize> {
     let inputs = match primitive {

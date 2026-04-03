@@ -482,7 +482,6 @@ fn lowering_and_device_router_preserve_logical_route_guidance_when_resources_are
             cil: Some(cil.clone()),
             device_design: Some(lowered_direct),
             route_image: Some(route_direct),
-            ..BitgenOptions::default()
         },
     )?
     .value;
@@ -495,7 +494,6 @@ fn lowering_and_device_router_preserve_logical_route_guidance_when_resources_are
             cil: Some(cil.clone()),
             device_design: Some(lowered_detour),
             route_image: Some(route_detour),
-            ..BitgenOptions::default()
         },
     )?
     .value;

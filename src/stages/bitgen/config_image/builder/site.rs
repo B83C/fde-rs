@@ -48,12 +48,7 @@ pub(super) fn encode_programmed_site(
         match resolve_site_config(site_def, &request.cfg_name, &request.function_name) {
             ConfigResolution::Matched(bits) => {
                 image.register_config(
-                    source.tile_name,
-                    source.tile_type,
-                    source.x,
-                    source.y,
-                    source.rows,
-                    source.cols,
+                    source,
                     &site.site_name,
                     &request.cfg_name,
                     &request.function_name,

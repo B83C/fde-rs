@@ -3,9 +3,8 @@ use quick_xml::events::{BytesDecl, BytesStart, Event};
 use std::path::Path;
 
 use super::{
-    CIL_PROPERTY, DesignXmlWriter, GCLK_PORTS, GCLKIOB_PORTS, IOB_PORTS,
-    PHYSICAL_EXTERNAL_LIB, PhysicalDesignView, PhysicalInstance, PhysicalNet, SLICE_PORTS,
-    WORK_LIB, XmlWriteContext,
+    CIL_PROPERTY, DesignXmlWriter, GCLK_PORTS, GCLKIOB_PORTS, IOB_PORTS, PHYSICAL_EXTERNAL_LIB,
+    PhysicalDesignView, PhysicalInstance, PhysicalNet, SLICE_PORTS, WORK_LIB, XmlWriteContext,
 };
 use crate::ir::Design;
 

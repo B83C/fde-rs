@@ -36,17 +36,7 @@ pub(super) fn encode_route_pip(
         cols: tile_def.sram_cols,
     };
 
-    image.register_config(
-        source.tile_name,
-        source.tile_type,
-        source.x,
-        source.y,
-        source.rows,
-        source.cols,
-        &pip.site_name,
-        &pip.from_net,
-        &pip.to_net,
-    );
+    image.register_config(source, &pip.site_name, &pip.from_net, &pip.to_net);
 
     for bit in &pip.bits {
         let Some(mapping) = find_route_sram(tile_site, bit) else {

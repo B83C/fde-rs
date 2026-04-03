@@ -16,25 +16,33 @@ use super::{
     router::{RouteNetKind, RouteSinkContext},
 };
 
+pub(super) struct NeighborAvailability<'a> {
+    pub(super) occupied_route_sinks: &'a HashMap<(usize, usize, WireId), RouteSinkOwner>,
+    pub(super) occupied_route_nodes: &'a HashMap<RouteNode, RouteNodeOwner>,
+    pub(super) net_index: usize,
+    pub(super) net_origin: NetOrigin,
+    pub(super) tree_nodes: &'a HashSet<RouteNode>,
+}
+
 pub(super) fn neighbor_is_available(
-    occupied_route_sinks: &HashMap<(usize, usize, WireId), RouteSinkOwner>,
-    occupied_route_nodes: &HashMap<RouteNode, RouteNodeOwner>,
-    net_index: usize,
-    net_origin: NetOrigin,
-    tree_nodes: &HashSet<RouteNode>,
+    availability: &NeighborAvailability<'_>,
     current: &RouteNode,
     neighbor: &RouteNode,
     local_arc: Option<usize>,
 ) -> bool {
-    route_node_is_available(occupied_route_nodes, net_index, neighbor, tree_nodes)
-        && route_sink_is_available(
-            occupied_route_sinks,
-            net_index,
-            net_origin,
-            current,
-            neighbor,
-            local_arc,
-        )
+    route_node_is_available(
+        availability.occupied_route_nodes,
+        availability.net_index,
+        neighbor,
+        availability.tree_nodes,
+    ) && route_sink_is_available(
+        availability.occupied_route_sinks,
+        availability.net_index,
+        availability.net_origin,
+        current,
+        neighbor,
+        local_arc,
+    )
 }
 
 pub(super) fn node_has_successors(context: &RouteSinkContext<'_>, node: &RouteNode) -> bool {

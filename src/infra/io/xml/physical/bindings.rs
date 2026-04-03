@@ -38,23 +38,27 @@ pub(super) fn build_slice_configs(
 ) -> Vec<(String, String)> {
     let mut configs = default_config_map(SLICE_DEFAULT_CONFIGS);
     for (cell_name, binding) in cells {
-        let Some(cell) = design.cells.iter().find(|candidate| candidate.name == *cell_name) else {
+        let Some(cell) = design
+            .cells
+            .iter()
+            .find(|candidate| candidate.name == *cell_name)
+        else {
             continue;
         };
-        if binding.kind == SliceCellKind::Lut {
-            if let Some(function) = packed_lut_function_name(cell) {
-                let cfg_name = if binding.slot == 0 { "F" } else { "G" };
-                let mux_name = if binding.slot == 0 { "FXMUX" } else { "GYMUX" };
-                configs.insert(cfg_name.to_string(), function);
-                configs.insert(mux_name.to_string(), cfg_name.to_string());
-                let used_name = if binding.slot == 0 { "XUSED" } else { "YUSED" };
-                let used_value = if lut_has_routed_sink(design, cell, cells, binding.slot) {
-                    "0"
-                } else {
-                    "#OFF"
-                };
-                configs.insert(used_name.to_string(), used_value.to_string());
-            }
+        if binding.kind == SliceCellKind::Lut
+            && let Some(function) = packed_lut_function_name(cell)
+        {
+            let cfg_name = if binding.slot == 0 { "F" } else { "G" };
+            let mux_name = if binding.slot == 0 { "FXMUX" } else { "GYMUX" };
+            configs.insert(cfg_name.to_string(), function);
+            configs.insert(mux_name.to_string(), cfg_name.to_string());
+            let used_name = if binding.slot == 0 { "XUSED" } else { "YUSED" };
+            let used_value = if lut_has_routed_sink(design, cell, cells, binding.slot) {
+                "0"
+            } else {
+                "#OFF"
+            };
+            configs.insert(used_name.to_string(), used_value.to_string());
         }
         if binding.kind == SliceCellKind::Sequential {
             let ff_name = if binding.slot == 0 { "FFX" } else { "FFY" };
@@ -136,7 +140,8 @@ fn lut_has_routed_sink(
     design.nets.iter().any(|net| {
         output_nets.contains(net.name.as_str())
             && net.sinks.iter().any(|sink| {
-                let Some(sink_cell) = design.cells.iter().find(|cell| cell.name == sink.name) else {
+                let Some(sink_cell) = design.cells.iter().find(|cell| cell.name == sink.name)
+                else {
                     return true;
                 };
                 let Some(binding) = bindings.get(sink_cell.name.as_str()) else {

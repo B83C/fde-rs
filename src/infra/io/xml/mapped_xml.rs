@@ -292,7 +292,8 @@ fn mapped_instance(
         .filter(|child| child.has_tag_name("property"))
     {
         let key = attr(&property, "name");
-        let value = normalized_mapped_property_value(&instance.cell, &key, attr(&property, "value"));
+        let value =
+            normalized_mapped_property_value(&instance.cell, &key, attr(&property, "value"));
         if instance.keep {
             let key = if key.eq_ignore_ascii_case("INIT") {
                 "lut_init".to_string()
@@ -336,42 +337,6 @@ fn mapped_cell(name: String, module_ref: &str, module: &MappedXmlModule) -> Cell
         (CellKind::Unknown, module_ref.to_string())
     };
     Cell::new(name, kind, type_name)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::load_fde_mapped_design_xml;
-    use roxmltree::Document;
-
-    #[test]
-    fn mapped_lut_init_bare_values_are_imported_as_hex() {
-        let xml = r#"
-<design name="demo">
-  <external name="cell_lib">
-    <module name="LUT3" type="LUT">
-      <port name="ADR0" direction="input"/>
-      <port name="ADR1" direction="input"/>
-      <port name="ADR2" direction="input"/>
-      <port name="O" direction="output"/>
-    </module>
-  </external>
-  <library name="work_lib">
-    <module name="demo" type="GENERIC">
-      <contents>
-        <instance name="id00001" moduleRef="LUT3" libraryRef="cell_lib">
-          <property name="INIT" value="96"/>
-        </instance>
-      </contents>
-    </module>
-  </library>
-  <topModule name="demo" libraryRef="work_lib"/>
-</design>
-"#;
-        let doc = Document::parse(xml).expect("xml parse");
-        let design = load_fde_mapped_design_xml(doc.root_element()).expect("mapped xml import");
-        let cell = design.cells.iter().find(|cell| cell.name == "id00001").expect("lut cell");
-        assert_eq!(cell.property("lut_init"), Some("0x96"));
-    }
 }
 
 fn is_physical_site_instance(module_ref: &str) -> bool {
@@ -422,5 +387,45 @@ fn disjoint_union(parent: &mut [usize], lhs: usize, rhs: usize) {
     let rhs_root = disjoint_find(parent, rhs);
     if lhs_root != rhs_root {
         parent[rhs_root] = lhs_root;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_fde_mapped_design_xml;
+    use roxmltree::Document;
+
+    #[test]
+    fn mapped_lut_init_bare_values_are_imported_as_hex() {
+        let xml = r#"
+<design name="demo">
+  <external name="cell_lib">
+    <module name="LUT3" type="LUT">
+      <port name="ADR0" direction="input"/>
+      <port name="ADR1" direction="input"/>
+      <port name="ADR2" direction="input"/>
+      <port name="O" direction="output"/>
+    </module>
+  </external>
+  <library name="work_lib">
+    <module name="demo" type="GENERIC">
+      <contents>
+        <instance name="id00001" moduleRef="LUT3" libraryRef="cell_lib">
+          <property name="INIT" value="96"/>
+        </instance>
+      </contents>
+    </module>
+  </library>
+  <topModule name="demo" libraryRef="work_lib"/>
+</design>
+"#;
+        let doc = Document::parse(xml).expect("xml parse");
+        let design = load_fde_mapped_design_xml(doc.root_element()).expect("mapped xml import");
+        let cell = design
+            .cells
+            .iter()
+            .find(|cell| cell.name == "id00001")
+            .expect("lut cell");
+        assert_eq!(cell.property("lut_init"), Some("0x96"));
     }
 }

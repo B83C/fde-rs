@@ -110,21 +110,21 @@ fn emit_slice_requests(program: &SliceProgram, site_def: &SiteDef) -> Vec<Reques
         }
     }
 
-    if let Some(lut) = &program.slots[0].lut {
-        if matches!(lut.output_usage, SliceLutOutputUsage::RoutedOutput) {
-            requests.push(RequestedConfig {
-                cfg_name: "XUSED".to_string(),
-                function_name: "0".to_string(),
-            });
-        }
+    if let Some(lut) = &program.slots[0].lut
+        && matches!(lut.output_usage, SliceLutOutputUsage::RoutedOutput)
+    {
+        requests.push(RequestedConfig {
+            cfg_name: "XUSED".to_string(),
+            function_name: "0".to_string(),
+        });
     }
-    if let Some(lut) = &program.slots[1].lut {
-        if matches!(lut.output_usage, SliceLutOutputUsage::RoutedOutput) {
-            requests.push(RequestedConfig {
-                cfg_name: "YUSED".to_string(),
-                function_name: "0".to_string(),
-            });
-        }
+    if let Some(lut) = &program.slots[1].lut
+        && matches!(lut.output_usage, SliceLutOutputUsage::RoutedOutput)
+    {
+        requests.push(RequestedConfig {
+            cfg_name: "YUSED".to_string(),
+            function_name: "0".to_string(),
+        });
     }
 
     if program.has_sequential() {

@@ -7,7 +7,9 @@ use anyhow::Result;
 use quick_xml::events::{BytesDecl, BytesStart, Event};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{super::lut_expr::encode_lut_expression_literal, DesignXmlWriter, LOGICAL_EXTERNAL_LIB, WORK_LIB};
+use super::{
+    super::lut_expr::encode_lut_expression_literal, DesignXmlWriter, LOGICAL_EXTERNAL_LIB, WORK_LIB,
+};
 
 impl DesignXmlWriter {
     pub(super) fn write_logical_design(
@@ -118,7 +120,11 @@ impl DesignXmlWriter {
         self.end_element("library")
     }
 
-    pub(super) fn write_design_port(&mut self, port: &Port, include_capacitance: bool) -> Result<()> {
+    pub(super) fn write_design_port(
+        &mut self,
+        port: &Port,
+        include_capacitance: bool,
+    ) -> Result<()> {
         let mut properties = Vec::new();
         if let Some(pin) = port.pin.as_deref() {
             properties.push(("fde_pin", pin.to_string(), None));
@@ -205,7 +211,10 @@ impl DesignXmlWriter {
         for (index, segment) in segments.iter().enumerate() {
             self.write_property(
                 &format!("fde_segment_{index:04}"),
-                &format!("{},{},{},{}", segment.x0, segment.y0, segment.x1, segment.y1),
+                &format!(
+                    "{},{},{},{}",
+                    segment.x0, segment.y0, segment.x1, segment.y1
+                ),
                 Some("segment"),
             )?;
         }
@@ -247,18 +256,24 @@ fn collect_external_modules(design: &Design) -> Vec<ExternalModule> {
             .collect::<BTreeMap<_, _>>();
         let primitive = cell.primitive_kind();
         for pin in &cell.inputs {
-            port_map.entry(pin.port.clone()).or_insert_with(|| ExternalPort {
-                name: pin.port.clone(),
-                direction: PortDirection::Input,
-                port_type: primitive.is_clock_pin(&pin.port).then(|| "clock".to_string()),
-            });
+            port_map
+                .entry(pin.port.clone())
+                .or_insert_with(|| ExternalPort {
+                    name: pin.port.clone(),
+                    direction: PortDirection::Input,
+                    port_type: primitive
+                        .is_clock_pin(&pin.port)
+                        .then(|| "clock".to_string()),
+                });
         }
         for pin in &cell.outputs {
-            port_map.entry(pin.port.clone()).or_insert_with(|| ExternalPort {
-                name: pin.port.clone(),
-                direction: PortDirection::Output,
-                port_type: None,
-            });
+            port_map
+                .entry(pin.port.clone())
+                .or_insert_with(|| ExternalPort {
+                    name: pin.port.clone(),
+                    direction: PortDirection::Output,
+                    port_type: None,
+                });
         }
         if cell.type_name == "LOGIC_0" {
             port_map
@@ -307,7 +322,11 @@ fn mapped_external_modules(design: &Design) -> Vec<ExternalModule> {
             "LUT2",
             "LUT",
             Vec::new(),
-            vec![("ADR0", "input", None), ("ADR1", "input", None), ("O", "output", None)],
+            vec![
+                ("ADR0", "input", None),
+                ("ADR1", "input", None),
+                ("O", "output", None),
+            ],
         ),
         (
             "LUT3",
@@ -324,7 +343,11 @@ fn mapped_external_modules(design: &Design) -> Vec<ExternalModule> {
             "DFFHQ",
             "FFLATCH",
             vec![("edge", "rise")],
-            vec![("D", "input", None), ("CK", "input", Some("clock")), ("Q", "output", None)],
+            vec![
+                ("D", "input", None),
+                ("CK", "input", Some("clock")),
+                ("Q", "output", None),
+            ],
         ),
         (
             "IBUF",
@@ -472,7 +495,9 @@ pub(super) fn packed_lut_function_name(cell: &Cell) -> Option<String> {
 
 fn logical_lut_input_count(primitive: PrimitiveKind) -> Option<usize> {
     match primitive {
-        PrimitiveKind::Lut { inputs: Some(inputs) } => Some(inputs),
+        PrimitiveKind::Lut {
+            inputs: Some(inputs),
+        } => Some(inputs),
         PrimitiveKind::Lut { inputs: None }
         | PrimitiveKind::FlipFlop
         | PrimitiveKind::Latch
@@ -487,7 +512,9 @@ fn logical_lut_input_count(primitive: PrimitiveKind) -> Option<usize> {
 
 fn logical_truth_table_bits(primitive: PrimitiveKind) -> Option<usize> {
     let inputs = match primitive {
-        PrimitiveKind::Lut { inputs: Some(inputs) } => inputs,
+        PrimitiveKind::Lut {
+            inputs: Some(inputs),
+        } => inputs,
         PrimitiveKind::Lut { inputs: None }
         | PrimitiveKind::FlipFlop
         | PrimitiveKind::Latch
@@ -517,8 +544,6 @@ fn format_truth_table_literal(bits: &[u8]) -> String {
     }
     format!("0x{digits}")
 }
-
-
 
 pub(super) fn pin_map_indices(cell: &Cell, logical_index: usize) -> Vec<usize> {
     let key = pin_map_property_name(logical_index);

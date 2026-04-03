@@ -22,5 +22,7 @@ pub use net::{Net, RoutePip, RouteSegment};
 pub use placement::{Cluster, Placement, PlacementSite};
 pub use port::{Port, PortDirection};
 pub use property::{CellPin, Property};
-pub use slice_assignment::{AssignedClusterCell, AssignedClusterCellKind, assign_cluster_slice_cells};
+pub use slice_assignment::{
+    AssignedClusterCell, AssignedClusterCellKind, assign_cluster_slice_cells,
+};
 pub use timing::{TimingEdge, TimingGraph, TimingNode, TimingPath, TimingSummary};

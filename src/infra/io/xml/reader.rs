@@ -1,4 +1,6 @@
-use super::{mapped_xml::load_fde_mapped_design_xml, physical_import::load_fde_physical_design_xml};
+use super::{
+    mapped_xml::load_fde_mapped_design_xml, physical_import::load_fde_physical_design_xml,
+};
 use anyhow::{Context, Result, bail};
 use roxmltree::Document;
 

@@ -7,7 +7,9 @@ use super::endpoint::{ResolvedRouteEndpoint, resolve_route_endpoint};
 use super::guide::{GuideDistances, GuideRouteMode, GuidedRouteNode, OrderedGuide, guide_penalty};
 use super::heap::{frontier_heap_pop, frontier_heap_push};
 use super::occupancy::{RouteNodeOwner, RouteSinkOwner, reserve_route_nodes, reserve_route_sinks};
-use super::policy::{classify_route_net_kind, neighbor_is_available, neighbors};
+use super::policy::{
+    NeighborAvailability, classify_route_net_kind, neighbor_is_available, neighbors,
+};
 
 use super::{
     lookup::route_context_for_node,
@@ -469,22 +471,20 @@ fn route_sink_following_guide(
         },
         |guided| guided.node,
         |state, visit| {
+            let availability = NeighborAvailability {
+                occupied_route_sinks,
+                occupied_route_nodes,
+                net_index: spec.net_index,
+                net_origin: spec.net_origin,
+                tree_nodes: spec.tree_nodes,
+            };
             for (neighbor, local_arc) in neighbors(
                 context,
                 &state.node.node,
                 spec.net_kind,
                 spec.strict_clock_sink,
             ) {
-                if !neighbor_is_available(
-                    occupied_route_sinks,
-                    occupied_route_nodes,
-                    spec.net_index,
-                    spec.net_origin,
-                    spec.tree_nodes,
-                    &state.node.node,
-                    &neighbor,
-                    local_arc,
-                ) {
+                if !neighbor_is_available(&availability, &state.node.node, &neighbor, local_arc) {
                     continue;
                 }
                 let Some(next_guide_index) = spec.ordered_guide.advance(
@@ -538,19 +538,17 @@ fn route_sink_with_policy(
         },
         |node| node,
         |state, visit| {
+            let availability = NeighborAvailability {
+                occupied_route_sinks,
+                occupied_route_nodes,
+                net_index: spec.net_index,
+                net_origin: spec.net_origin,
+                tree_nodes: spec.tree_nodes,
+            };
             for (neighbor, local_arc) in
                 neighbors(context, &state.node, spec.net_kind, spec.strict_clock_sink)
             {
-                if !neighbor_is_available(
-                    occupied_route_sinks,
-                    occupied_route_nodes,
-                    spec.net_index,
-                    spec.net_origin,
-                    spec.tree_nodes,
-                    &state.node,
-                    &neighbor,
-                    local_arc,
-                ) {
+                if !neighbor_is_available(&availability, &state.node, &neighbor, local_arc) {
                     continue;
                 }
                 if let Some(limit) = max_guide_distance
