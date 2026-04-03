@@ -26,6 +26,63 @@ enum Token {
 struct ParsedName {
     display: String,
     stable_name: String,
+    member: Option<ParsedMember>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedMember {
+    base_key: String,
+    ordinal: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArrayRange {
+    msb: usize,
+    lsb: usize,
+}
+
+impl ArrayRange {
+    fn from_width(width: usize) -> Self {
+        Self {
+            msb: width.saturating_sub(1),
+            lsb: 0,
+        }
+    }
+
+    fn width(self) -> usize {
+        self.msb.abs_diff(self.lsb).saturating_add(1)
+    }
+
+    fn member_name(self, base: &str, ordinal: usize) -> Option<String> {
+        if ordinal >= self.width() {
+            return None;
+        }
+        let index = if self.msb >= self.lsb {
+            self.msb - ordinal
+        } else {
+            self.msb + ordinal
+        };
+        Some(indexed_name(base, index))
+    }
+
+    fn declaration_names(self, base: &str) -> Vec<String> {
+        (0..self.width())
+            .filter_map(|ordinal| self.member_name(base, ordinal))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ArraySpec {
+    display_base: String,
+    range: ArrayRange,
+}
+
+#[derive(Debug, Clone)]
+struct PortDecl {
+    names: Vec<String>,
+    array_key: Option<String>,
+    array_spec: Option<ArraySpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +225,7 @@ struct Parser<'a> {
     source: &'a str,
     cursor: usize,
     peeked: Option<Token>,
+    current_port_arrays: BTreeMap<String, ArraySpec>,
 }
 
 impl<'a> Parser<'a> {
@@ -176,6 +234,7 @@ impl<'a> Parser<'a> {
             source,
             cursor: 0,
             peeked: None,
+            current_port_arrays: BTreeMap::new(),
         }
     }
 
@@ -274,6 +333,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_view(&mut self, builder: &mut DesignBuilder) -> Result<()> {
+        self.current_port_arrays.clear();
         let _ = self.parse_name_expr()?;
         while !self.peek_is_rparen()? {
             if self.peek_is_lparen()? {
@@ -308,8 +368,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_port(&mut self, builder: &mut DesignBuilder) -> Result<()> {
-        let names = self.parse_port_decl_names()?;
-        if names.is_empty() {
+        let decl = self.parse_port_decl_names()?;
+        if decl.names.is_empty() {
             return Err(self.error("malformed port"));
         }
         let mut direction = PortDirection::Input;
@@ -328,7 +388,11 @@ impl<'a> Parser<'a> {
         }
         self.expect_rparen()?;
 
-        for name in names {
+        if let (Some(array_key), Some(array_spec)) = (decl.array_key, decl.array_spec) {
+            self.current_port_arrays.insert(array_key, array_spec);
+        }
+
+        for name in decl.names {
             let mut port = Port::new(name, direction.clone());
             port.width = 1;
             builder.push_port(port);
@@ -518,11 +582,17 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_port_ref(&mut self) -> Result<PendingEndpoint> {
-        let pin = self
+        let parsed_pin = self
             .parse_name_expr()?
-            .map(|name| name.display)
-            .unwrap_or_default();
-        let mut target = EndpointTarget::Port(pin.clone());
+            .ok_or_else(|| self.error("malformed portRef"))?;
+        let raw_pin = parsed_pin.display;
+        let port_name = parsed_pin
+            .member
+            .as_ref()
+            .and_then(|member| self.resolve_current_port_member(member))
+            .unwrap_or_else(|| raw_pin.clone());
+        let mut pin = port_name.clone();
+        let mut target = EndpointTarget::Port(port_name);
 
         while !self.peek_is_rparen()? {
             if self.peek_is_lparen()? {
@@ -530,7 +600,8 @@ impl<'a> Parser<'a> {
                 let head = self.expect_atom()?;
                 match head.as_str() {
                     "instanceRef" => {
-                        target = EndpointTarget::InstanceRef(self.parse_instance_ref()?)
+                        target = EndpointTarget::InstanceRef(self.parse_instance_ref()?);
+                        pin = raw_pin.clone();
                     }
                     _ => self.skip_current_list()?,
                 }
@@ -560,6 +631,7 @@ impl<'a> Parser<'a> {
             Some(Token::Atom(_)) => Ok(self.parse_atom_value()?.map(|value| ParsedName {
                 display: value.clone(),
                 stable_name: value,
+                member: None,
             })),
             Some(Token::LParen) => {
                 self.expect_lparen()?;
@@ -581,6 +653,7 @@ impl<'a> Parser<'a> {
                         Some(ParsedName {
                             display,
                             stable_name,
+                            member: None,
                         })
                     }
                     "array" => {
@@ -595,13 +668,15 @@ impl<'a> Parser<'a> {
                         Some(ParsedName {
                             display: value.clone(),
                             stable_name: value,
+                            member: None,
                         })
                     }
                     "member" => {
-                        let value = self
-                            .parse_name_expr()?
-                            .map(|name| name.display)
-                            .unwrap_or_default();
+                        let value = self.parse_name_expr()?.unwrap_or(ParsedName {
+                            display: String::new(),
+                            stable_name: String::new(),
+                            member: None,
+                        });
                         let index = self
                             .parse_atom_value()?
                             .and_then(|value| value.parse::<usize>().ok())
@@ -610,10 +685,14 @@ impl<'a> Parser<'a> {
                             self.skip_value()?;
                         }
                         self.expect_rparen()?;
-                        let indexed = indexed_name(&value, index);
+                        let indexed = indexed_name(&value.display, index);
                         Some(ParsedName {
                             display: indexed.clone(),
                             stable_name: indexed,
+                            member: Some(ParsedMember {
+                                base_key: value.stable_name,
+                                ordinal: index,
+                            }),
                         })
                     }
                     _ => {
@@ -627,21 +706,26 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_port_decl_names(&mut self) -> Result<Vec<String>> {
+    fn parse_port_decl_names(&mut self) -> Result<PortDecl> {
         match self.peek_token()? {
-            Some(Token::Atom(_)) => Ok(self
-                .parse_atom_value()?
-                .map(|name| vec![name])
-                .unwrap_or_default()),
+            Some(Token::Atom(_)) => Ok(PortDecl {
+                names: self
+                    .parse_atom_value()?
+                    .map(|name| vec![name])
+                    .unwrap_or_default(),
+                array_key: None,
+                array_spec: None,
+            }),
             Some(Token::LParen) => {
                 self.expect_lparen()?;
                 let head = self.expect_atom()?;
-                let names = match head.as_str() {
+                let decl = match head.as_str() {
                     "array" => {
-                        let base = self
-                            .parse_name_expr()?
-                            .map(|name| name.display)
-                            .unwrap_or_default();
+                        let base = self.parse_name_expr()?.unwrap_or(ParsedName {
+                            display: String::new(),
+                            stable_name: String::new(),
+                            member: None,
+                        });
                         let width = self
                             .parse_atom_value()?
                             .and_then(|value| value.parse::<usize>().ok())
@@ -650,9 +734,27 @@ impl<'a> Parser<'a> {
                             self.skip_value()?;
                         }
                         self.expect_rparen()?;
-                        (0..width)
-                            .map(|index| indexed_name(&base, index))
-                            .collect::<Vec<_>>()
+                        let (display_base, range) = match parse_bus_range_name(&base.display) {
+                            Some((display_base, range)) => {
+                                if range.width() != width {
+                                    return Err(self.error(format!(
+                                        "array size mismatch for '{}' (declared {width}, range width {})",
+                                        base.display,
+                                        range.width()
+                                    )));
+                                }
+                                (display_base, range)
+                            }
+                            None => (base.display.clone(), ArrayRange::from_width(width)),
+                        };
+                        PortDecl {
+                            names: range.declaration_names(&display_base),
+                            array_key: Some(base.stable_name),
+                            array_spec: Some(ArraySpec {
+                                display_base,
+                                range,
+                            }),
+                        }
                     }
                     "rename" => {
                         let _ = self.parse_name_expr()?;
@@ -664,17 +766,35 @@ impl<'a> Parser<'a> {
                             self.skip_value()?;
                         }
                         self.expect_rparen()?;
-                        vec![display]
+                        PortDecl {
+                            names: vec![display],
+                            array_key: None,
+                            array_spec: None,
+                        }
                     }
                     _ => {
                         self.skip_current_list()?;
-                        Vec::new()
+                        PortDecl {
+                            names: Vec::new(),
+                            array_key: None,
+                            array_spec: None,
+                        }
                     }
                 };
-                Ok(names)
+                Ok(decl)
             }
-            Some(Token::RParen) | None => Ok(Vec::new()),
+            Some(Token::RParen) | None => Ok(PortDecl {
+                names: Vec::new(),
+                array_key: None,
+                array_spec: None,
+            }),
         }
+    }
+
+    fn resolve_current_port_member(&self, member: &ParsedMember) -> Option<String> {
+        self.current_port_arrays
+            .get(&member.base_key)
+            .and_then(|spec| spec.range.member_name(&spec.display_base, member.ordinal))
     }
 
     fn parse_atom_value(&mut self) -> Result<Option<String>> {
@@ -932,6 +1052,23 @@ fn indexed_name(base: &str, index: usize) -> String {
     format!("{base}[{index}]")
 }
 
+fn parse_bus_range_name(name: &str) -> Option<(String, ArrayRange)> {
+    let (open, close) = [('[' , ']'), ('(', ')'), ('<', '>')]
+        .into_iter()
+        .find(|(open, close)| name.ends_with(*close) && name.contains(*open))?;
+    let split = name.rfind(open)?;
+    let base = name[..split].to_string();
+    let range = &name[split + 1..name.len().checked_sub(close.len_utf8())?];
+    let (msb, lsb) = range.split_once(':')?;
+    Some((
+        base,
+        ArrayRange {
+            msb: msb.parse().ok()?,
+            lsb: lsb.parse().ok()?,
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_source;
@@ -1105,7 +1242,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             port_names,
-            vec!["clk", "bus_in[0]", "bus_in[1]", "bus_out[0]", "bus_out[1]"]
+            vec!["clk", "bus_in[1]", "bus_in[0]", "bus_out[1]", "bus_out[0]"]
         );
 
         let net0 = design
@@ -1115,7 +1252,7 @@ mod tests {
             .expect("net0");
         assert_eq!(
             net0.driver.as_ref().map(|driver| driver.name.as_str()),
-            Some("bus_in[0]")
+            Some("bus_in[1]")
         );
 
         let net2 = design
@@ -1125,7 +1262,64 @@ mod tests {
             .expect("net2");
         assert_eq!(
             net2.sinks.first().map(|sink| sink.name.as_str()),
-            Some("bus_out[1]")
+            Some("bus_out[0]")
+        );
+    }
+
+    #[test]
+    fn resolves_renamed_array_ports_using_member_ordinals() {
+        let design = parse_source(
+            r#"
+            (edif top
+              (library DESIGN
+                (cell top
+                  (view NETLIST
+                    (interface
+                      (port (array (rename BUS "bus[3:1]") 3) (direction OUTPUT)))
+                    (contents
+                      (instance u0
+                        (viewRef NETLIST (cellRef LUT2 (libraryRef LIB))))
+                      (net net0
+                        (joined
+                          (portRef O (instanceRef u0))
+                          (portRef (member BUS 0))))
+                      (net net1
+                        (joined
+                          (portRef O (instanceRef u0))
+                          (portRef (member BUS 1))))
+                      (net net2
+                        (joined
+                          (portRef O (instanceRef u0))
+                          (portRef (member BUS 2)))))))))
+            "#,
+        )
+        .expect("parse renamed array");
+
+        let port_names = design
+            .ports
+            .iter()
+            .map(|port| port.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(port_names, vec!["bus[3]", "bus[2]", "bus[1]"]);
+
+        let net0 = design
+            .nets
+            .iter()
+            .find(|net| net.name == "net0")
+            .expect("net0");
+        assert_eq!(
+            net0.sinks.first().map(|sink| sink.name.as_str()),
+            Some("bus[3]")
+        );
+
+        let net2 = design
+            .nets
+            .iter()
+            .find(|net| net.name == "net2")
+            .expect("net2");
+        assert_eq!(
+            net2.sinks.first().map(|sink| sink.name.as_str()),
+            Some("bus[1]")
         );
     }
 }
