@@ -307,6 +307,12 @@ fn mapped_external_modules(design: &Design) -> Vec<ExternalModule> {
     let mut modules = Vec::new();
     for (name, module_type, properties, ports) in [
         (
+            "LUT1",
+            "LUT",
+            Vec::new(),
+            vec![("ADR0", "input", None), ("O", "output", None)],
+        ),
+        (
             "LUT4",
             "LUT",
             Vec::new(),

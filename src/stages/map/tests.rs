@@ -1,5 +1,6 @@
 use super::{MapArtifact, MapOptions, export_structural_verilog, run};
 use crate::{
+    io::{load_design, save_design},
     ir::{Cell, CellKind, Design, Endpoint, EndpointKind, Net, Port},
     map::{
         lut::all_ones_truth_table, lut::all_zeros_truth_table,
@@ -7,6 +8,7 @@ use crate::{
     },
 };
 use anyhow::Result;
+use tempfile::TempDir;
 
 fn mapped_design() -> Design {
     Design {
@@ -278,6 +280,48 @@ fn map_buffers_ff_data_inputs_that_are_not_lut_driven() -> Result<()> {
             .iter()
             .any(|sink| sink.name == "ff0" && sink.pin == "D")
     );
+
+    Ok(())
+}
+
+#[test]
+fn mapped_xml_roundtrip_preserves_inserted_lut1_helpers() -> Result<()> {
+    let design = Design {
+        name: "ff-buf-roundtrip".to_string(),
+        ports: vec![Port::input("din"), Port::input("clk"), Port::output("q")],
+        cells: vec![
+            Cell::ff("ff0", "DFFHQ")
+                .with_input("D", "din")
+                .with_input("CK", "clk")
+                .with_output("Q", "q_net"),
+        ],
+        nets: vec![
+            Net::new("din")
+                .with_driver(Endpoint::new(EndpointKind::Port, "din", "din"))
+                .with_sink(Endpoint::new(EndpointKind::Cell, "ff0", "D")),
+            Net::new("clk")
+                .with_driver(Endpoint::new(EndpointKind::Port, "clk", "clk"))
+                .with_sink(Endpoint::new(EndpointKind::Cell, "ff0", "CK")),
+            Net::new("q_net")
+                .with_driver(Endpoint::new(EndpointKind::Cell, "ff0", "Q"))
+                .with_sink(Endpoint::new(EndpointKind::Port, "q", "q")),
+        ],
+        ..Design::default()
+    };
+
+    let artifact = run(design, &MapOptions::default())?.value;
+    let temp = TempDir::new()?;
+    let path = temp.path().join("mapped.xml");
+    save_design(&artifact.design, &path)?;
+    let roundtripped = load_design(&path)?;
+
+    let buffer = roundtripped
+        .cells
+        .iter()
+        .find(|cell| cell.type_name == "LUT1")
+        .expect("buffer LUT after mapped XML roundtrip");
+    assert_eq!(buffer.type_name, "LUT1");
+    assert_eq!(buffer.property("lut_init"), Some("0x2"));
 
     Ok(())
 }
