@@ -1,7 +1,5 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    fs,
-};
+use rustc_hash::FxHashMap as HashMap;
+use std::{collections::BTreeMap, fs};
 
 use tempfile::NamedTempFile;
 
@@ -189,7 +187,7 @@ fn roundtrips_text_bitstream_back_into_tile_columns() {
         &arch,
         &cil,
         &config_image,
-        &HashMap::new(),
+        &HashMap::default(),
         &mut expected_notes,
     );
     assert!(expected_notes.is_empty());

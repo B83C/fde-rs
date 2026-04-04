@@ -176,6 +176,7 @@ fn dedicated_clock_policy_reaches_cxx_clock_spine() {
     let stitch_db = crate::resource::routing::load_tile_stitch_db(&arch_path, &mut wires)
         .expect("load stitch db");
     let stitched_components = build_stitched_components(&stitch_db, &arch, &wires);
+    let tile_cache = super::lookup::TileRouteCache::build(&arch, &cil, &graphs);
 
     let source = super::types::RouteNode::new(34, 27, wires.intern("CLKB_GCLK1_PW"));
     let checkpoints = [
@@ -187,10 +188,8 @@ fn dedicated_clock_policy_reaches_cxx_clock_spine() {
     ];
     let context = super::router::RouteSinkContext {
         arch: &arch,
-        cil: &cil,
-        graphs: &graphs,
-        stitch_db: &stitch_db,
         stitched_components: &stitched_components,
+        tile_cache: &tile_cache,
         wires: &mut wires,
     };
 

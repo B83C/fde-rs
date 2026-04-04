@@ -5,7 +5,8 @@ use crate::{
     resource::{Arch, TileInstance},
     route::RouteBit,
 };
-use std::collections::{BTreeMap, HashMap};
+use rustc_hash::FxHashMap as HashMap;
+use std::collections::BTreeMap;
 
 #[test]
 fn applies_default_transmission_bits_into_frame_images() {
@@ -51,14 +52,16 @@ fn applies_default_transmission_bits_into_frame_images() {
         )]),
         ..Arch::default()
     };
-    let transmission_defaults = HashMap::from([(
+    let transmission_defaults = [(
         "GSB_CNT".to_string(),
         vec![RouteBit {
             basic_cell: "sw0".to_string(),
             sram_name: "EN".to_string(),
             value: 0,
         }],
-    )]);
+    )]
+    .into_iter()
+    .collect::<HashMap<_, _>>();
 
     let mut notes = Vec::new();
     let columns = build_tile_columns(
@@ -155,7 +158,7 @@ fn relocates_default_site_bits_into_owner_tiles() {
         &arch,
         &cil,
         &ConfigImage::default(),
-        &HashMap::new(),
+        &HashMap::default(),
         &mut notes,
     );
 
@@ -270,7 +273,7 @@ fn relocates_config_assignments_into_owner_tiles() {
     };
 
     let mut notes = Vec::new();
-    let columns = build_tile_columns(&arch, &cil, &config_image, &HashMap::new(), &mut notes);
+    let columns = build_tile_columns(&arch, &cil, &config_image, &HashMap::default(), &mut notes);
 
     let owner = columns
         .get(&0)

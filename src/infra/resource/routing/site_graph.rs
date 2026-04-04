@@ -5,11 +5,9 @@ use super::{
 use crate::cil::{Cil, ElementPath};
 use anyhow::Result;
 use roxmltree::Document;
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    fs,
-    path::Path,
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use smallvec::SmallVec;
+use std::{collections::BTreeMap, fs, path::Path};
 
 pub(crate) fn load_site_route_graphs(
     path: &Path,
@@ -27,7 +25,7 @@ pub(crate) fn load_site_route_graphs(
                 .map(|transmission| transmission.site_type.clone())
         })
         .collect::<HashSet<_>>();
-    let mut graphs = SiteRouteGraphs::new();
+    let mut graphs = SiteRouteGraphs::default();
 
     for library in doc
         .root_element()
@@ -43,7 +41,7 @@ pub(crate) fn load_site_route_graphs(
             }
 
             let mut instance_types = BTreeMap::<String, String>::new();
-            let mut pin_to_nets = HashMap::<(String, String), Vec<WireId>>::new();
+            let mut pin_to_nets = HashMap::<(String, String), Vec<WireId>>::default();
             if let Some(contents) = cell.children().find(|node| node.has_tag_name("contents")) {
                 for instance in contents
                     .children()
@@ -77,7 +75,7 @@ pub(crate) fn load_site_route_graphs(
             }
 
             let mut arcs = Vec::new();
-            let mut seen = HashSet::new();
+            let mut seen = HashSet::default();
             for (instance_name, element_name) in &instance_types {
                 let Some(element) = cil.elements.get(element_name) else {
                     continue;
@@ -130,9 +128,16 @@ pub(crate) fn load_site_route_graphs(
                 })
                 .collect();
 
-            let mut adjacency = HashMap::<WireId, Vec<usize>>::new();
+            let mut adjacency = vec![SmallVec::<[usize; 4]>::new(); wires.len()];
             for (index, arc) in arcs.iter().enumerate() {
-                adjacency.entry(arc.from).or_default().push(index);
+                if should_skip_site_arc(name, arc, wires) {
+                    continue;
+                }
+                let wire_index = arc.from.index();
+                if wire_index >= adjacency.len() {
+                    adjacency.resize(wire_index + 1, SmallVec::new());
+                }
+                adjacency[wire_index].push(index);
             }
             graphs.insert(
                 name.to_string(),
@@ -166,4 +171,14 @@ fn path_bits(path: &ElementPath) -> Vec<RouteBit> {
             value: setting.value,
         })
         .collect()
+}
+
+fn should_skip_site_arc(site_type: &str, arc: &SiteRouteArc, wires: &WireInterner) -> bool {
+    if site_type != "GSB_LFT" {
+        return false;
+    }
+
+    let from = wires.resolve(arc.from);
+    let to = wires.resolve(arc.to);
+    to.starts_with("LEFT_O") && from.starts_with("LEFT_H6") && from.contains("_BUF")
 }

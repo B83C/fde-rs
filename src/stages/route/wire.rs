@@ -1,6 +1,8 @@
-use crate::{
-    domain::{is_dedicated_clock_wire_name, is_hex_like_wire_name, is_long_wire_name},
-    resource::Arch,
+#[cfg(test)]
+use crate::domain::{is_dedicated_clock_wire_name, is_hex_like_wire_name, is_long_wire_name};
+use crate::resource::{
+    Arch,
+    routing::{CanonicalWireFamily, WireId, WireInterner},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +23,7 @@ pub(crate) enum RouteNodeClass {
     Sink,
 }
 
+#[cfg(test)]
 pub(crate) fn canonical_indexed_wire(raw: &str) -> Option<(&'static str, usize)> {
     for prefix in [
         "LEFT_LLH",
@@ -80,6 +83,7 @@ pub(crate) fn canonical_indexed_wire(raw: &str) -> Option<(&'static str, usize)>
     None
 }
 
+#[cfg(test)]
 pub(crate) fn wire_bounds(arch: &Arch, x: usize, y: usize, raw: &str) -> Option<WireBounds> {
     let (family, _) = canonical_indexed_wire(raw)?;
     Some(match family {
@@ -111,10 +115,45 @@ pub(crate) fn wire_bounds(arch: &Arch, x: usize, y: usize, raw: &str) -> Option<
     })
 }
 
+pub(crate) fn wire_bounds_for_wire(
+    arch: &Arch,
+    x: usize,
+    y: usize,
+    wires: &WireInterner,
+    wire: WireId,
+) -> Option<WireBounds> {
+    let family = wires.metadata(wire).family()?;
+    Some(match family {
+        CanonicalWireFamily::E => span_bounds(arch, x, y, 0, 1),
+        CanonicalWireFamily::W => span_bounds(arch, x, y, 0, -1),
+        CanonicalWireFamily::N => span_bounds(arch, x, y, -1, 0),
+        CanonicalWireFamily::S => span_bounds(arch, x, y, 1, 0),
+        CanonicalWireFamily::H6E => span_bounds(arch, x, y, 0, 6),
+        CanonicalWireFamily::H6W => span_bounds(arch, x, y, 0, -6),
+        CanonicalWireFamily::H6M => centered_span_bounds(arch, x, y, 6, true),
+        CanonicalWireFamily::V6N => span_bounds(arch, x, y, -6, 0),
+        CanonicalWireFamily::V6S => span_bounds(arch, x, y, 6, 0),
+        CanonicalWireFamily::V6M => centered_span_bounds(arch, x, y, 6, false),
+        CanonicalWireFamily::Llh => WireBounds {
+            min_x: x.min(arch.width.saturating_sub(1)),
+            max_x: x.min(arch.width.saturating_sub(1)),
+            min_y: 0,
+            max_y: arch.height.saturating_sub(1),
+        },
+        CanonicalWireFamily::Llv => WireBounds {
+            min_x: 0,
+            max_x: arch.width.saturating_sub(1),
+            min_y: y.min(arch.height.saturating_sub(1)),
+            max_y: y.min(arch.height.saturating_sub(1)),
+        },
+    })
+}
+
 pub(crate) fn tile_distance(x0: usize, y0: usize, x1: usize, y1: usize) -> usize {
     x0.abs_diff(x1) + y0.abs_diff(y1)
 }
 
+#[cfg(test)]
 pub(crate) fn route_node_class(
     raw: &str,
     bounds: Option<WireBounds>,
@@ -131,6 +170,36 @@ pub(crate) fn route_node_class(
         return RouteNodeClass::Long;
     }
     if is_hex_like_wire_name(raw) {
+        return RouteNodeClass::Hex;
+    }
+    if matches!(length, 1 | 2) {
+        return RouteNodeClass::Single;
+    }
+    if has_successors {
+        RouteNodeClass::Source
+    } else {
+        RouteNodeClass::Sink
+    }
+}
+
+pub(crate) fn route_node_class_for_wire(
+    wires: &WireInterner,
+    wire: WireId,
+    bounds: Option<WireBounds>,
+    has_successors: bool,
+) -> RouteNodeClass {
+    let metadata = wires.metadata(wire);
+    if metadata.is_dedicated_clock() {
+        return RouteNodeClass::Clock;
+    }
+
+    let length = bounds
+        .map(|bounds| bounds.max_x - bounds.min_x + bounds.max_y - bounds.min_y)
+        .unwrap_or(0);
+    if metadata.is_long() && length != 0 {
+        return RouteNodeClass::Long;
+    }
+    if metadata.is_hex_like() {
         return RouteNodeClass::Hex;
     }
     if matches!(length, 1 | 2) {

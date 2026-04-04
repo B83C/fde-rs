@@ -1,6 +1,7 @@
 use super::{ComponentBounds, RouteNode, StitchedComponentDb, TileStitchDb, WireInterner};
 use crate::resource::Arch;
-use std::collections::{HashMap, HashSet, VecDeque};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 
 use super::stitch::stitched_neighbors;
 
@@ -9,9 +10,10 @@ pub(crate) fn build_stitched_components(
     arch: &Arch,
     wires: &WireInterner,
 ) -> StitchedComponentDb {
-    let mut bounds_by_node = HashMap::<RouteNode, ComponentBounds>::new();
-    let mut representative_by_node = HashMap::<RouteNode, RouteNode>::new();
-    let mut visited = HashSet::<RouteNode>::new();
+    let mut bounds_by_node = HashMap::<RouteNode, ComponentBounds>::default();
+    let mut neighbors_by_node = HashMap::default();
+    let mut representative_by_node = HashMap::<RouteNode, RouteNode>::default();
+    let mut visited = HashSet::<RouteNode>::default();
 
     for tile in arch.tiles.values() {
         let Some(tile_stitch) = db.tiles.get(tile.tile_type.as_str()) else {
@@ -29,12 +31,16 @@ pub(crate) fn build_stitched_components(
             while let Some(node) = queue.pop_front() {
                 component.push(node);
                 bounds.include(&node);
-                for (next_x, next_y, next_wire) in stitched_neighbors(db, arch, wires, &node) {
-                    let next = RouteNode::new(next_x, next_y, next_wire);
-                    if visited.insert(next) {
-                        queue.push_back(next);
+                let neighbors = stitched_neighbors(db, arch, wires, &node)
+                    .into_iter()
+                    .map(|(next_x, next_y, next_wire)| RouteNode::new(next_x, next_y, next_wire))
+                    .collect::<smallvec::SmallVec<[RouteNode; 8]>>();
+                for next in &neighbors {
+                    if visited.insert(*next) {
+                        queue.push_back(*next);
                     }
                 }
+                neighbors_by_node.insert(node, neighbors);
             }
 
             let representative = component
@@ -51,6 +57,7 @@ pub(crate) fn build_stitched_components(
 
     StitchedComponentDb {
         bounds_by_node,
+        neighbors_by_node,
         representative_by_node,
     }
 }

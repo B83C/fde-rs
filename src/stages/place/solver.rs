@@ -270,12 +270,13 @@ fn full_state(context: &SolveContext<'_>, current: Vec<Option<Point>>) -> FullAn
 
 fn best_incremental_trial(
     context: &SolveContext<'_>,
-    evaluator: &PlacementEvaluator<'_>,
+    evaluator: &mut PlacementEvaluator<'_>,
     current_occupancy: &[SiteOccupancy],
     focus: ClusterId,
     candidates: CandidateTargets,
 ) -> Option<PlacementCandidate> {
-    let mut best_trial: Option<PlacementCandidate> = None;
+    let mut best_updates: Option<ClusterUpdates> = None;
+    let mut best_total = f64::INFINITY;
     for target in candidates {
         let Some(changes) = plan_target_updates(
             evaluator.placements(),
@@ -288,16 +289,14 @@ fn best_incremental_trial(
         ) else {
             continue;
         };
-        let trial = evaluator.evaluate_candidate(&changes);
-        let metrics = trial.metrics();
-        if best_trial
-            .as_ref()
-            .is_none_or(|best_candidate| metrics.total < best_candidate.metrics().total)
-        {
-            best_trial = Some(trial);
+        let metrics = evaluator.evaluate_candidate_metrics(&changes);
+        if metrics.total < best_total {
+            best_total = metrics.total;
+            best_updates = Some(changes);
         }
     }
-    best_trial
+
+    best_updates.map(|changes| evaluator.evaluate_candidate(&changes))
 }
 
 fn maybe_apply_incremental_swap(
@@ -307,9 +306,9 @@ fn maybe_apply_incremental_swap(
     rng: &mut ChaCha8Rng,
 ) {
     if let Some(swapped) = random_swap_updates(state.evaluator.placements(), context.movable, rng) {
-        let swap_candidate = state.evaluator.evaluate_candidate(&swapped);
-        let swap_metrics = swap_candidate.metrics().clone();
+        let swap_metrics = state.evaluator.evaluate_candidate_metrics(&swapped);
         if swap_metrics.total < state.metrics.total {
+            let swap_candidate = state.evaluator.evaluate_candidate(&swapped);
             state.evaluator.apply_candidate(swap_candidate);
             state.occupancy = occupancy_map(
                 state.evaluator.placements(),
@@ -344,7 +343,7 @@ fn solve_incremental(context: &SolveContext<'_>) -> Result<PlacementSolution> {
         )?;
         let best_trial = best_incremental_trial(
             context,
-            &state.evaluator,
+            &mut state.evaluator,
             &state.occupancy,
             focus,
             candidates,
@@ -573,10 +572,11 @@ fn refine_solution(
                 if changes.is_empty() {
                     continue;
                 }
-                let trial = evaluator.evaluate_candidate(&changes);
-                if trial.metrics().total + 1e-9 >= evaluator.metrics().total {
+                let trial_metrics = evaluator.evaluate_candidate_metrics(&changes);
+                if trial_metrics.total + 1e-9 >= evaluator.metrics().total {
                     continue;
                 }
+                let trial = evaluator.evaluate_candidate(&changes);
                 if best_trial
                     .as_ref()
                     .is_none_or(|best| trial.metrics().total + 1e-9 < best.metrics().total)

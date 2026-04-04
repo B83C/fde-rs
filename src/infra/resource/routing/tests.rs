@@ -130,7 +130,8 @@ fn site_route_graphs_sort_instances_by_name_for_stable_arc_order() {
     let graphs = load_site_route_graphs(file.path(), &cil, &mut wires).expect("load graphs");
     let graph = graphs.get("GSB_CNT").expect("GSB_CNT graph");
     let src = wires.intern("SRC");
-    let indices = graph.adjacency.get(&src).expect("SRC adjacency");
+    let indices = graph.adjacency(src);
+    assert!(!indices.is_empty(), "SRC adjacency");
     let arcs = indices
         .iter()
         .map(|&index| {

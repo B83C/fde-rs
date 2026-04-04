@@ -40,6 +40,7 @@ pub(crate) struct PlacementEvaluator<'a> {
     locality_weights: Vec<f64>,
     congestion_score_raw: f64,
     metrics: PlacementMetrics,
+    scratch: EvaluationScratch,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +74,17 @@ struct EvaluationState {
     metrics: PlacementMetrics,
 }
 
+#[derive(Debug, Clone)]
+struct EvaluationScratch {
+    affected_nets_seen: Vec<bool>,
+    affected_nets: Vec<usize>,
+    load_deltas: Vec<f64>,
+    touched_loads: Vec<usize>,
+    touched_mask: Vec<bool>,
+    affected_locality_seen: Vec<bool>,
+    affected_locality: Vec<ClusterId>,
+}
+
 struct CandidateNetEffects {
     wire_cost: f64,
     timing_cost: f64,
@@ -84,6 +96,12 @@ struct CandidateNetEffects {
 struct CandidateLocalityEffects {
     cost: f64,
     updates: Vec<(ClusterId, f64)>,
+}
+
+struct CandidateNetMetrics {
+    wire_cost: f64,
+    timing_cost: f64,
+    congestion_score_raw: f64,
 }
 
 impl<'a> PlacementEvaluator<'a> {
@@ -110,6 +128,7 @@ impl<'a> PlacementEvaluator<'a> {
             locality_weights: evaluation.locality_weights,
             congestion_score_raw: evaluation.congestion_score_raw,
             metrics: evaluation.metrics,
+            scratch: EvaluationScratch::new(model, arch),
         }
     }
 
@@ -121,7 +140,7 @@ impl<'a> PlacementEvaluator<'a> {
         &self.metrics
     }
 
-    pub(crate) fn evaluate_candidate<P>(&self, updates: &[(ClusterId, P)]) -> PlacementCandidate
+    pub(crate) fn evaluate_candidate<P>(&mut self, updates: &[(ClusterId, P)]) -> PlacementCandidate
     where
         P: Copy + Into<Point>,
     {
@@ -149,6 +168,30 @@ impl<'a> PlacementEvaluator<'a> {
             locality_updates: locality_effects.updates,
             metrics,
         }
+    }
+
+    pub(crate) fn evaluate_candidate_metrics<P>(
+        &mut self,
+        updates: &[(ClusterId, P)],
+    ) -> PlacementMetrics
+    where
+        P: Copy + Into<Point>,
+    {
+        let updates = normalize_candidate_updates(updates);
+        if updates.is_empty() {
+            return self.metrics.clone();
+        }
+
+        let moved_clusters = moved_clusters(&updates);
+        let net_metrics = self.candidate_net_metrics(&updates, &moved_clusters);
+        let locality_cost = self.candidate_locality_cost(&updates, &moved_clusters);
+        compose_metrics(
+            self.mode,
+            net_metrics.wire_cost,
+            net_metrics.congestion_score_raw,
+            net_metrics.timing_cost,
+            locality_cost,
+        )
     }
 
     pub(crate) fn apply_candidate(&mut self, candidate: PlacementCandidate) {
@@ -191,20 +234,19 @@ impl<'a> PlacementEvaluator<'a> {
     }
 
     fn candidate_net_effects(
-        &self,
+        &mut self,
         updates: &ClusterUpdates,
         moved_clusters: &[ClusterId],
     ) -> CandidateNetEffects {
-        let affected_nets = affected_nets(self.model, moved_clusters);
+        self.collect_affected_nets(moved_clusters);
         let mut wire_cost = self.metrics.wire_cost;
         let mut timing_cost = self.metrics.timing_cost;
         let mut congestion_score_raw = self.congestion_score_raw;
-        let mut load_deltas = vec![0.0; self.loads.len()];
-        let mut touched_loads = Vec::new();
-        let mut touched_mask = vec![false; self.loads.len()];
-        let mut net_updates = Vec::with_capacity(affected_nets.len());
+        let affected_nets_len = self.scratch.affected_nets.len();
+        let mut net_updates = Vec::with_capacity(affected_nets_len);
 
-        for net_index in affected_nets {
+        for affected_index in 0..affected_nets_len {
+            let net_index = self.scratch.affected_nets[affected_index];
             if let Some(previous) = self.net_models.get(net_index).and_then(Option::as_ref) {
                 wire_cost -= previous.wire_cost();
                 timing_cost -= previous.timing_cost();
@@ -212,9 +254,9 @@ impl<'a> PlacementEvaluator<'a> {
                     previous,
                     self.arch,
                     -1.0,
-                    &mut load_deltas,
-                    &mut touched_loads,
-                    &mut touched_mask,
+                    &mut self.scratch.load_deltas,
+                    &mut self.scratch.touched_loads,
+                    &mut self.scratch.touched_mask,
                 );
             }
 
@@ -235,45 +277,119 @@ impl<'a> PlacementEvaluator<'a> {
                     next,
                     self.arch,
                     1.0,
-                    &mut load_deltas,
-                    &mut touched_loads,
-                    &mut touched_mask,
+                    &mut self.scratch.load_deltas,
+                    &mut self.scratch.touched_loads,
+                    &mut self.scratch.touched_mask,
                 );
             }
             net_updates.push((net_index, next_model));
         }
 
-        for index in &touched_loads {
+        for index in &self.scratch.touched_loads {
             let previous = self.loads.get(*index).copied().unwrap_or(0.0);
-            let next = previous + load_deltas[*index];
+            let next = previous + self.scratch.load_deltas[*index];
             congestion_score_raw += overflow_score(next) - overflow_score(previous);
         }
+
+        let load_deltas = self
+            .scratch
+            .touched_loads
+            .iter()
+            .copied()
+            .filter_map(|index| {
+                let delta = self.scratch.load_deltas[index];
+                (delta.abs() > f64::EPSILON).then_some((index, delta))
+            })
+            .collect();
+
+        self.clear_candidate_net_scratch();
 
         CandidateNetEffects {
             wire_cost,
             timing_cost,
             congestion_score_raw,
-            load_deltas: touched_loads
-                .into_iter()
-                .filter_map(|index| {
-                    let delta = load_deltas[index];
-                    (delta.abs() > f64::EPSILON).then_some((index, delta))
-                })
-                .collect(),
+            load_deltas,
             net_updates,
         }
     }
 
+    fn candidate_net_metrics(
+        &mut self,
+        updates: &ClusterUpdates,
+        moved_clusters: &[ClusterId],
+    ) -> CandidateNetMetrics {
+        self.collect_affected_nets(moved_clusters);
+        let mut wire_cost = self.metrics.wire_cost;
+        let mut timing_cost = self.metrics.timing_cost;
+        let mut congestion_score_raw = self.congestion_score_raw;
+        let affected_nets_len = self.scratch.affected_nets.len();
+
+        for affected_index in 0..affected_nets_len {
+            let net_index = self.scratch.affected_nets[affected_index];
+            if let Some(previous) = self.net_models.get(net_index).and_then(Option::as_ref) {
+                wire_cost -= previous.wire_cost();
+                timing_cost -= previous.timing_cost();
+                accumulate_load_delta(
+                    previous,
+                    self.arch,
+                    -1.0,
+                    &mut self.scratch.load_deltas,
+                    &mut self.scratch.touched_loads,
+                    &mut self.scratch.touched_mask,
+                );
+            }
+
+            let next_model = self.model.nets.get(net_index).and_then(|net| {
+                build_net_model_with_overrides(
+                    net,
+                    self.model,
+                    &self.placements,
+                    updates,
+                    self.delay,
+                    self.mode,
+                )
+            });
+            if let Some(next) = next_model.as_ref() {
+                wire_cost += next.wire_cost();
+                timing_cost += next.timing_cost();
+                accumulate_load_delta(
+                    next,
+                    self.arch,
+                    1.0,
+                    &mut self.scratch.load_deltas,
+                    &mut self.scratch.touched_loads,
+                    &mut self.scratch.touched_mask,
+                );
+            }
+        }
+
+        for index in &self.scratch.touched_loads {
+            let previous = self.loads.get(*index).copied().unwrap_or(0.0);
+            let next = previous + self.scratch.load_deltas[*index];
+            congestion_score_raw += overflow_score(next) - overflow_score(previous);
+        }
+
+        self.clear_candidate_net_scratch();
+
+        CandidateNetMetrics {
+            wire_cost,
+            timing_cost,
+            congestion_score_raw,
+        }
+    }
+
     fn candidate_locality_effects(
-        &self,
+        &mut self,
         updates: &ClusterUpdates,
         moved_clusters: &[ClusterId],
     ) -> CandidateLocalityEffects {
-        let affected_clusters = affected_locality_clusters(self.graph, moved_clusters);
+        self.collect_affected_locality_clusters(moved_clusters);
         let mut cost = self.metrics.locality_cost;
-        let mut updates_out = Vec::with_capacity(affected_clusters.len());
+        let affected_locality_len = self.scratch.affected_locality.len();
+        let mut updates_out = Vec::with_capacity(affected_locality_len);
 
-        for cluster_id in affected_clusters {
+        for affected_index in 0..affected_locality_len {
+            let cluster_id = self.scratch.affected_locality[affected_index];
             let previous = self
                 .locality_terms
                 .get(cluster_id.index())
@@ -291,10 +407,93 @@ impl<'a> PlacementEvaluator<'a> {
             updates_out.push((cluster_id, next));
         }
 
+        self.clear_candidate_locality_scratch();
+
         CandidateLocalityEffects {
             cost,
             updates: updates_out,
         }
+    }
+
+    fn candidate_locality_cost(
+        &mut self,
+        updates: &ClusterUpdates,
+        moved_clusters: &[ClusterId],
+    ) -> f64 {
+        self.collect_affected_locality_clusters(moved_clusters);
+        let mut cost = self.metrics.locality_cost;
+
+        for affected_index in 0..self.scratch.affected_locality.len() {
+            let cluster_id = self.scratch.affected_locality[affected_index];
+            let previous = self
+                .locality_terms
+                .get(cluster_id.index())
+                .copied()
+                .unwrap_or(0.0);
+            let next = locality_term(
+                cluster_id,
+                self.graph,
+                &self.placements,
+                updates,
+                &self.locality_weights,
+            )
+            .unwrap_or(0.0);
+            cost += next - previous;
+        }
+
+        self.clear_candidate_locality_scratch();
+        cost
+    }
+
+    fn collect_affected_nets(&mut self, moved_clusters: &[ClusterId]) {
+        self.scratch.affected_nets.clear();
+        for cluster_id in moved_clusters {
+            for net_index in self.model.nets_for_cluster(*cluster_id) {
+                if let Some(slot) = self.scratch.affected_nets_seen.get_mut(*net_index)
+                    && !*slot
+                {
+                    *slot = true;
+                    self.scratch.affected_nets.push(*net_index);
+                }
+            }
+        }
+    }
+
+    fn clear_candidate_net_scratch(&mut self) {
+        for &index in &self.scratch.touched_loads {
+            self.scratch.load_deltas[index] = 0.0;
+            self.scratch.touched_mask[index] = false;
+        }
+        self.scratch.touched_loads.clear();
+        for &net_index in &self.scratch.affected_nets {
+            self.scratch.affected_nets_seen[net_index] = false;
+        }
+        self.scratch.affected_nets.clear();
+    }
+
+    fn collect_affected_locality_clusters(&mut self, moved_clusters: &[ClusterId]) {
+        self.scratch.affected_locality.clear();
+        for cluster_id in moved_clusters {
+            self.mark_affected_locality_cluster(*cluster_id);
+            for (neighbor, _) in self.graph.neighbors(*cluster_id) {
+                self.mark_affected_locality_cluster(*neighbor);
+            }
+        }
+    }
+
+    fn mark_affected_locality_cluster(&mut self, cluster_id: ClusterId) {
+        let slot = &mut self.scratch.affected_locality_seen[cluster_id.index()];
+        if !*slot {
+            *slot = true;
+            self.scratch.affected_locality.push(cluster_id);
+        }
+    }
+
+    fn clear_candidate_locality_scratch(&mut self) {
+        for &cluster_id in &self.scratch.affected_locality {
+            self.scratch.affected_locality_seen[cluster_id.index()] = false;
+        }
+        self.scratch.affected_locality.clear();
     }
 }
 
@@ -341,7 +540,7 @@ where
         .collect()
 }
 
-fn moved_clusters(updates: &ClusterUpdates) -> Vec<ClusterId> {
+fn moved_clusters(updates: &ClusterUpdates) -> SmallVec<[ClusterId; 2]> {
     updates.iter().map(|(cluster_id, _)| *cluster_id).collect()
 }
 
@@ -418,61 +617,6 @@ fn build_net_models(
             .map(|net| build_net_model(net, model, placements, delay, mode))
             .collect::<Vec<_>>()
     }
-}
-
-fn affected_nets(model: &PlacementModel, moved_clusters: &[ClusterId]) -> Vec<usize> {
-    let mut seen = vec![false; model.nets.len()];
-    let mut nets = Vec::new();
-    for cluster_id in moved_clusters {
-        for net_index in model.nets_for_cluster(*cluster_id) {
-            if let Some(slot) = seen.get_mut(*net_index)
-                && !*slot
-            {
-                *slot = true;
-                nets.push(*net_index);
-            }
-        }
-    }
-    nets
-}
-
-fn affected_locality_clusters(
-    graph: &ClusterGraph,
-    moved_clusters: &[ClusterId],
-) -> Vec<ClusterId> {
-    let max_clusters = moved_clusters
-        .iter()
-        .map(|cluster_id| cluster_id.index())
-        .chain(moved_clusters.iter().flat_map(|cluster_id| {
-            graph
-                .neighbors(*cluster_id)
-                .iter()
-                .map(|(neighbor, _)| neighbor.index())
-        }))
-        .max()
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let mut seen = vec![false; max_clusters.max(1)];
-    let mut affected = Vec::new();
-    for cluster_id in moved_clusters {
-        if cluster_id.index() >= seen.len() {
-            seen.resize(cluster_id.index() + 1, false);
-        }
-        if !seen[cluster_id.index()] {
-            seen[cluster_id.index()] = true;
-            affected.push(*cluster_id);
-        }
-        for (neighbor, _) in graph.neighbors(*cluster_id) {
-            if neighbor.index() >= seen.len() {
-                seen.resize(neighbor.index() + 1, false);
-            }
-            if !seen[neighbor.index()] {
-                seen[neighbor.index()] = true;
-                affected.push(*neighbor);
-            }
-        }
-    }
-    affected
 }
 
 fn locality_term(
@@ -672,5 +816,21 @@ impl NetModel {
 
     fn timing_cost(&self) -> f64 {
         self.weight * (self.route_delay + 0.12 * self.driver_span)
+    }
+}
+
+impl EvaluationScratch {
+    fn new(model: &PlacementModel, arch: &Arch) -> Self {
+        let load_count = arch.width.saturating_mul(arch.height).max(1);
+        let cluster_count = model.cluster_count().max(1);
+        Self {
+            affected_nets_seen: vec![false; model.nets.len()],
+            affected_nets: Vec::new(),
+            load_deltas: vec![0.0; load_count],
+            touched_loads: Vec::new(),
+            touched_mask: vec![false; load_count],
+            affected_locality_seen: vec![false; cluster_count],
+            affected_locality: Vec::new(),
+        }
     }
 }

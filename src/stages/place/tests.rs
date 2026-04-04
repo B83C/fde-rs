@@ -505,10 +505,12 @@ fn incremental_evaluator_matches_full_recompute_for_move_and_swap() {
 
     let move_updates = vec![(clb1, (3usize, 1usize))];
     let move_candidate = evaluator.evaluate_candidate(&move_updates);
+    let repeated_move_candidate = evaluator.evaluate_candidate(&move_updates);
     let mut moved = placements.clone();
     moved[clb1.index()] = Some(Point::new(3, 1));
     let moved_metrics = evaluate(&model, &graph, &moved, &arch, Some(&delay), mode);
     assert_metrics_close(move_candidate.metrics(), &moved_metrics);
+    assert_metrics_close(repeated_move_candidate.metrics(), &moved_metrics);
 
     evaluator.apply_candidate(move_candidate);
     assert_metrics_close(evaluator.metrics(), &moved_metrics);

@@ -225,6 +225,7 @@ dependencies = [
  "rand_chacha",
  "rayon",
  "roxmltree",
+ "rustc-hash",
  "serde",
  "serde_json",
  "sha2",
@@ -482,6 +483,12 @@ checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
 name = "rustix"

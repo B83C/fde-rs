@@ -1,18 +1,17 @@
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
-use std::collections::{HashMap, HashSet};
 
+use crate::domain::SiteKind;
 use crate::{
-    DeviceCell,
+    DeviceCell, domain::NetOrigin, resource::routing::WireMetadata, route::types::RouteNode,
+};
+#[cfg(test)]
+use crate::{
     domain::{
-        NetOrigin, SiteKind, is_clock_distribution_wire_name, is_clock_sink_wire_name,
-        is_directional_channel_wire_name, is_hex_like_wire_name, is_long_wire_name,
-        is_pad_stub_wire_name,
+        is_clock_distribution_wire_name, is_clock_sink_wire_name, is_directional_channel_wire_name,
+        is_hex_like_wire_name, is_long_wire_name, is_pad_stub_wire_name,
     },
-    resource::routing::stitched_neighbors,
-    route::{
-        lookup::{TileRouteContext, route_context_for_node},
-        types::{RouteNode, SiteRouteArc, WireId, WireInterner},
-    },
+    route::types::{SiteRouteArc, WireInterner},
 };
 
 use super::{
@@ -22,19 +21,24 @@ use super::{
 
 pub(super) struct NeighborAvailability<'a> {
     pub(super) stitched_components: &'a crate::resource::routing::StitchedComponentDb,
-    pub(super) occupied_route_sinks: &'a HashMap<(usize, usize, WireId), RouteSinkOwner>,
+    pub(super) occupied_route_sinks: &'a HashMap<RouteNode, RouteSinkOwner>,
     pub(super) occupied_route_nodes: &'a HashMap<RouteNode, RouteNodeOwner>,
     pub(super) net_index: usize,
     pub(super) net_origin: NetOrigin,
     pub(super) tree_nodes: &'a HashSet<RouteNode>,
 }
 
+#[inline(always)]
 pub(super) fn neighbor_is_available(
     availability: &NeighborAvailability<'_>,
     current: &RouteNode,
     neighbor: &RouteNode,
     local_arc: Option<usize>,
 ) -> bool {
+    if availability.tree_nodes.contains(neighbor) {
+        return true;
+    }
+
     route_node_is_available(
         availability.stitched_components,
         availability.occupied_route_nodes,
@@ -51,21 +55,16 @@ pub(super) fn neighbor_is_available(
     )
 }
 
+#[inline(always)]
 pub(super) fn node_has_successors(context: &RouteSinkContext<'_>, node: &RouteNode) -> bool {
-    if let Some(tile) = route_context_for_node(context.arch, context.cil, node)
-        && let Some(graph) = tile.graph(context.graphs)
-        && let Some(indices) = graph.adjacency.get(&node.wire)
-        && indices.iter().any(|index| {
-            graph
-                .arcs
-                .get(*index)
-                .is_some_and(|arc| !should_skip_local_arc(&tile, arc, context.wires))
-        })
+    if let Some(tile) = context.tile_context(node)
+        && let Some(graph) = tile.graph
+        && graph.has_adjacency(node.wire)
     {
         return true;
     }
 
-    !stitched_neighbors(context.stitch_db, context.arch, context.wires, node).is_empty()
+    context.stitched_components.has_neighbors(node)
 }
 
 pub(super) fn neighbors(
@@ -75,38 +74,37 @@ pub(super) fn neighbors(
     strict_clock_sink: bool,
 ) -> SmallVec<[(RouteNode, Option<usize>); 16]> {
     let mut result = SmallVec::new();
-    let current_name = context.wires.resolve(node.wire);
-    if let Some(tile) = route_context_for_node(context.arch, context.cil, node)
-        && let Some(graph) = tile.graph(context.graphs)
-        && let Some(indices) = graph.adjacency.get(&node.wire)
+    let current_metadata = context.wires.metadata(node.wire);
+    if let Some(tile) = context.tile_context(node)
+        && let Some(graph) = tile.graph
     {
-        for index in indices {
+        for index in graph.adjacency(node.wire) {
             let Some(arc) = graph.arcs.get(*index) else {
                 continue;
             };
-            if should_skip_local_arc(&tile, arc, context.wires) {
+            if !allow_clock_neighbor_metadata(
+                net_kind,
+                strict_clock_sink,
+                current_metadata,
+                context.wires.metadata(arc.to),
+            ) {
                 continue;
             }
-            let next_name = context.wires.resolve(arc.to);
-            if !allow_clock_neighbor(net_kind, strict_clock_sink, current_name, next_name) {
-                continue;
-            }
-            push_unique_neighbor(
-                &mut result,
-                RouteNode::new(node.x, node.y, arc.to),
-                Some(*index),
-            );
+            result.push((RouteNode::new(node.x, node.y, arc.to), Some(*index)));
         }
     }
 
-    for (next_x, next_y, next_wire) in
-        stitched_neighbors(context.stitch_db, context.arch, context.wires, node)
-    {
-        let next_name = context.wires.resolve(next_wire);
-        if !allow_clock_neighbor(net_kind, strict_clock_sink, current_name, next_name) {
+    for &neighbor in context.stitched_components.neighbors(node) {
+        let next_wire = neighbor.wire;
+        if !allow_clock_neighbor_metadata(
+            net_kind,
+            strict_clock_sink,
+            current_metadata,
+            context.wires.metadata(next_wire),
+        ) {
             continue;
         }
-        push_unique_neighbor(&mut result, RouteNode::new(next_x, next_y, next_wire), None);
+        result.push((neighbor, None));
     }
 
     result
@@ -124,6 +122,7 @@ pub(super) fn classify_route_net_kind(driver_cell: &DeviceCell) -> RouteNetKind 
     }
 }
 
+#[cfg(test)]
 pub(super) fn allow_clock_neighbor(
     net_kind: RouteNetKind,
     strict_clock_sink: bool,
@@ -145,6 +144,28 @@ pub(super) fn allow_clock_neighbor(
     is_clock_route_wire_name(next_name)
 }
 
+fn allow_clock_neighbor_metadata(
+    net_kind: RouteNetKind,
+    strict_clock_sink: bool,
+    current: WireMetadata,
+    next: WireMetadata,
+) -> bool {
+    if net_kind != RouteNetKind::DedicatedClock || !strict_clock_sink {
+        return true;
+    }
+
+    if !is_clock_route_wire_metadata(current) {
+        return false;
+    }
+
+    if next.is_clock_sink() {
+        return true;
+    }
+
+    is_clock_route_wire_metadata(next)
+}
+
+#[cfg(test)]
 fn is_clock_route_wire_name(raw: &str) -> bool {
     // C++ routed dedicated clocks do not stay on GCLK-only wires. Real baseline
     // paths fan out through LLH/H6/V6/channel/pad-stub branches before entering
@@ -156,8 +177,17 @@ fn is_clock_route_wire_name(raw: &str) -> bool {
         || is_pad_stub_wire_name(raw)
 }
 
+fn is_clock_route_wire_metadata(metadata: WireMetadata) -> bool {
+    metadata.is_clock_distribution()
+        || metadata.is_long()
+        || metadata.is_hex_like()
+        || metadata.is_directional_channel()
+        || metadata.is_pad_stub()
+}
+
+#[cfg(test)]
 pub(super) fn should_skip_local_arc(
-    tile: &TileRouteContext<'_>,
+    tile: &crate::route::lookup::TileRouteContext<'_>,
     arc: &SiteRouteArc,
     wires: &WireInterner,
 ) -> bool {
@@ -168,17 +198,6 @@ pub(super) fn should_skip_local_arc(
     let from = wires.resolve(arc.from);
     let to = wires.resolve(arc.to);
     to.starts_with("LEFT_O") && from.starts_with("LEFT_H6") && from.contains("_BUF")
-}
-
-fn push_unique_neighbor(
-    result: &mut SmallVec<[(RouteNode, Option<usize>); 16]>,
-    node: RouteNode,
-    local_arc: Option<usize>,
-) {
-    let candidate = (node, local_arc);
-    if !result.contains(&candidate) {
-        result.push(candidate);
-    }
 }
 
 #[cfg(test)]

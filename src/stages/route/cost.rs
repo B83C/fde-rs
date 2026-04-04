@@ -1,6 +1,9 @@
 use crate::route::{
     types::RouteNode,
-    wire::{WireBounds, route_node_base_cost, route_node_class, tile_distance, wire_bounds},
+    wire::{
+        WireBounds, route_node_base_cost, route_node_class_for_wire, tile_distance,
+        wire_bounds_for_wire,
+    },
 };
 
 use super::{
@@ -29,12 +32,9 @@ pub(super) fn route_heuristic(
     sink_y: usize,
 ) -> usize {
     let Some(bounds) = context.stitched_components.bounds(node) else {
-        if let Some(bounds) = wire_bounds(
-            context.arch,
-            node.x,
-            node.y,
-            context.wires.resolve(node.wire),
-        ) {
+        if let Some(bounds) =
+            wire_bounds_for_wire(context.arch, node.x, node.y, context.wires, node.wire)
+        {
             return axis_distance(sink_x, bounds.min_x, bounds.max_x)
                 + axis_distance(sink_y, bounds.min_y, bounds.max_y);
         }
@@ -46,7 +46,6 @@ pub(super) fn route_heuristic(
 }
 
 fn route_node_cost(context: &RouteSinkContext<'_>, node: &RouteNode) -> usize {
-    let raw = context.wires.resolve(node.wire);
     let bounds = context
         .stitched_components
         .bounds(node)
@@ -56,8 +55,13 @@ fn route_node_cost(context: &RouteSinkContext<'_>, node: &RouteNode) -> usize {
             min_y: bounds.min_y,
             max_y: bounds.max_y,
         })
-        .or_else(|| wire_bounds(context.arch, node.x, node.y, raw));
-    let class = route_node_class(raw, bounds, node_has_successors(context, node));
+        .or_else(|| wire_bounds_for_wire(context.arch, node.x, node.y, context.wires, node.wire));
+    let class = route_node_class_for_wire(
+        context.wires,
+        node.wire,
+        bounds,
+        node_has_successors(context, node),
+    );
     route_node_base_cost(class)
 }
 

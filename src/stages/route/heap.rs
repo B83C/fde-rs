@@ -1,5 +1,6 @@
 use super::types::SearchState;
 
+#[inline(always)]
 pub(super) fn frontier_heap_push<Node: Copy + Ord, Key: Copy + Ord>(
     heap: &mut Vec<SearchState<Node, Key>>,
     state: SearchState<Node, Key>,
@@ -9,6 +10,7 @@ pub(super) fn frontier_heap_push<Node: Copy + Ord, Key: Copy + Ord>(
     frontier_sift_up(heap, len);
 }
 
+#[inline(always)]
 pub(super) fn frontier_heap_pop<Node: Copy + Ord, Key: Copy + Ord>(
     heap: &mut Vec<SearchState<Node, Key>>,
 ) -> Option<SearchState<Node, Key>> {
@@ -34,6 +36,7 @@ pub(super) fn frontier_heap_pop<Node: Copy + Ord, Key: Copy + Ord>(
     heap.pop()
 }
 
+#[inline(always)]
 fn frontier_heap_prefers<Node: Copy + Ord, Key: Copy + Ord>(
     lhs: &SearchState<Node, Key>,
     rhs: &SearchState<Node, Key>,
@@ -41,6 +44,7 @@ fn frontier_heap_prefers<Node: Copy + Ord, Key: Copy + Ord>(
     lhs.priority > rhs.priority
 }
 
+#[inline(always)]
 fn frontier_sift_up<Node: Copy + Ord, Key: Copy + Ord>(
     heap: &mut [SearchState<Node, Key>],
     len: usize,
@@ -48,6 +52,7 @@ fn frontier_sift_up<Node: Copy + Ord, Key: Copy + Ord>(
     frontier_sift_up_to(heap, len);
 }
 
+#[inline(always)]
 fn frontier_sift_up_to<Node: Copy + Ord, Key: Copy + Ord>(
     heap: &mut [SearchState<Node, Key>],
     len: usize,
@@ -73,6 +78,7 @@ fn frontier_sift_up_to<Node: Copy + Ord, Key: Copy + Ord>(
     }
 }
 
+#[inline(always)]
 fn frontier_floyd_sift_down<Node: Copy + Ord, Key: Copy + Ord>(
     heap: &mut [SearchState<Node, Key>],
 ) -> usize {

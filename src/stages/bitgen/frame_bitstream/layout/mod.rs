@@ -4,7 +4,7 @@ mod image;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::{bitgen::ConfigImage, cil::Cil, route::RouteBit};
 

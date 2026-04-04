@@ -1,6 +1,6 @@
 use anyhow::Result;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
-use std::collections::{HashMap, HashSet};
 
 use super::cost::{route_heuristic, route_transition_cost};
 use super::endpoint::{ResolvedRouteEndpoint, resolve_route_endpoint};
@@ -12,7 +12,7 @@ use super::policy::{
 };
 
 use super::{
-    lookup::route_context_for_node,
+    lookup::TileRouteCache,
     mapping::{
         WireSet, endpoint_sink_nets, endpoint_source_nets, should_route_device_net,
         should_skip_unmapped_sink, sink_requires_all_wires,
@@ -30,7 +30,7 @@ use crate::{
     resource::{
         Arch,
         routing::{
-            StitchedComponentDb, TileStitchDb, build_stitched_components, load_site_route_graphs,
+            StitchedComponentDb, build_stitched_components, load_site_route_graphs,
             load_tile_stitch_db,
         },
     },
@@ -39,7 +39,6 @@ use crate::{
 struct LoadedRouteResources {
     wires: WireInterner,
     graphs: SiteRouteGraphs,
-    stitch_db: TileStitchDb,
     stitched_components: StitchedComponentDb,
 }
 
@@ -47,8 +46,10 @@ struct RoutingState {
     pips: Vec<DeviceRoutePip>,
     notes: Vec<String>,
     guide_usage: GuideUsageStats,
-    occupied_route_sinks: HashMap<(usize, usize, WireId), RouteSinkOwner>,
+    occupied_route_sinks: HashMap<RouteNode, RouteSinkOwner>,
     occupied_route_nodes: HashMap<RouteNode, RouteNodeOwner>,
+    policy_search: SearchScratch<RouteNode, WireId>,
+    guided_search: SearchScratch<GuidedRouteNode, (usize, WireId)>,
 }
 
 impl RoutingState {
@@ -57,8 +58,26 @@ impl RoutingState {
             pips: Vec::new(),
             notes: Vec::new(),
             guide_usage: GuideUsageStats::default(),
-            occupied_route_sinks: HashMap::new(),
-            occupied_route_nodes: HashMap::new(),
+            occupied_route_sinks: HashMap::default(),
+            occupied_route_nodes: HashMap::default(),
+            policy_search: SearchScratch::default(),
+            guided_search: SearchScratch::default(),
+        }
+    }
+}
+
+struct SearchScratch<Node, Key> {
+    frontier: Vec<SearchState<Node, Key>>,
+    best_cost: HashMap<Node, usize>,
+    parent: HashMap<Node, SearchParentStep<Node>>,
+}
+
+impl<Node, Key> Default for SearchScratch<Node, Key> {
+    fn default() -> Self {
+        Self {
+            frontier: Vec::new(),
+            best_cost: HashMap::default(),
+            parent: HashMap::default(),
         }
     }
 }
@@ -86,12 +105,11 @@ pub fn route_device_design(
     let mut resources = load_route_resources(arch, arch_path, cil)?;
     let index = DeviceDesignIndex::build(device);
     let mut state = RoutingState::new();
+    let tile_cache = TileRouteCache::build(arch, cil, &resources.graphs);
     let mut context = RouteSinkContext {
         arch,
-        cil,
-        graphs: &resources.graphs,
-        stitch_db: &resources.stitch_db,
         stitched_components: &resources.stitched_components,
+        tile_cache: &tile_cache,
         wires: &mut resources.wires,
     };
 
@@ -118,7 +136,6 @@ fn load_route_resources(
     Ok(LoadedRouteResources {
         wires,
         graphs,
-        stitch_db,
         stitched_components,
     })
 }
@@ -214,7 +231,7 @@ fn prepare_route_net<'a>(
         tree_nodes,
         tree_starts,
         tree_start_costs,
-        used_pips: HashSet::new(),
+        used_pips: HashSet::default(),
     })
 }
 
@@ -304,6 +321,8 @@ fn route_net_sink(
             context,
             &state.occupied_route_sinks,
             &state.occupied_route_nodes,
+            &mut state.policy_search,
+            &mut state.guided_search,
             &spec,
         ) else {
             state.notes.push(format!(
@@ -471,18 +490,23 @@ impl GuideUsageStats {
 
 pub(super) struct RouteSinkContext<'a> {
     pub(super) arch: &'a Arch,
-    pub(super) cil: &'a Cil,
-    pub(super) graphs: &'a SiteRouteGraphs,
-    pub(super) stitch_db: &'a TileStitchDb,
     pub(super) stitched_components: &'a StitchedComponentDb,
+    pub(super) tile_cache: &'a TileRouteCache<'a>,
     pub(super) wires: &'a mut WireInterner,
 }
 
 impl RouteSinkContext<'_> {
+    pub(super) fn tile_context(
+        &self,
+        node: &RouteNode,
+    ) -> Option<&super::lookup::CachedTileRouteContext<'_>> {
+        self.tile_cache.for_node(node)
+    }
+
     fn materialize_pip(&self, pip: RoutedPip, net_name: &str) -> Option<DeviceRoutePip> {
         let node = RouteNode::new(pip.x, pip.y, pip.to);
-        let tile = route_context_for_node(self.arch, self.cil, &node)?;
-        let graph = tile.graph(self.graphs)?;
+        let tile = self.tile_context(&node)?;
+        let graph = tile.graph?;
         let arc = graph.arcs.get(pip.local_arc)?;
         Some(tile.pip(net_name.to_string(), pip.x, pip.y, arc, self.wires))
     }
@@ -516,12 +540,17 @@ pub(super) struct SinkRouteSpec<'a> {
     pub(super) sink_wires: &'a [WireId],
 }
 
-fn ordered_start_nodes(spec: &SinkRouteSpec<'_>) -> Vec<RouteNode> {
-    let mut nodes = spec.tree_starts.iter().copied().collect::<Vec<_>>();
-    if nodes.is_empty() {
+fn ordered_start_nodes(spec: &SinkRouteSpec<'_>) -> SmallVec<[RouteNode; 8]> {
+    let mut nodes = SmallVec::<[RouteNode; 8]>::new();
+    if spec.tree_starts.is_empty() {
         nodes.extend_from_slice(spec.roots);
+    } else {
+        nodes.extend(spec.tree_starts.iter().copied());
     }
-    nodes.sort_by_key(|node| {
+    if nodes.len() <= 1 {
+        return nodes;
+    }
+    nodes.sort_unstable_by_key(|node| {
         (
             spec.tree_start_costs.get(node).copied().unwrap_or(0),
             tile_distance(node.x, node.y, spec.sink_x, spec.sink_y),
@@ -536,8 +565,10 @@ fn ordered_start_nodes(spec: &SinkRouteSpec<'_>) -> Vec<RouteNode> {
 
 fn route_sink(
     context: &RouteSinkContext<'_>,
-    occupied_route_sinks: &HashMap<(usize, usize, WireId), RouteSinkOwner>,
+    occupied_route_sinks: &HashMap<RouteNode, RouteSinkOwner>,
     occupied_route_nodes: &HashMap<RouteNode, RouteNodeOwner>,
+    policy_search: &mut SearchScratch<RouteNode, WireId>,
+    guided_search: &mut SearchScratch<GuidedRouteNode, (usize, WireId)>,
     spec: &SinkRouteSpec<'_>,
 ) -> Option<(SinkRoutePath, GuideRouteMode)> {
     if spec.net_kind == RouteNetKind::DedicatedClock {
@@ -545,15 +576,20 @@ fn route_sink(
             context,
             occupied_route_sinks,
             occupied_route_nodes,
+            policy_search,
             spec,
             None,
         )
         .map(|path| (path, GuideRouteMode::DedicatedClock));
     }
 
-    if let Some(path) =
-        route_sink_following_guide(context, occupied_route_sinks, occupied_route_nodes, spec)
-    {
+    if let Some(path) = route_sink_following_guide(
+        context,
+        occupied_route_sinks,
+        occupied_route_nodes,
+        guided_search,
+        spec,
+    ) {
         return Some((path, GuideRouteMode::Ordered));
     }
 
@@ -568,6 +604,7 @@ fn route_sink(
                 context,
                 occupied_route_sinks,
                 occupied_route_nodes,
+                policy_search,
                 spec,
                 max_guide_distance,
             ) {
@@ -581,6 +618,7 @@ fn route_sink(
         context,
         occupied_route_sinks,
         occupied_route_nodes,
+        policy_search,
         spec,
         None,
     )
@@ -589,8 +627,9 @@ fn route_sink(
 
 fn route_sink_following_guide(
     context: &RouteSinkContext<'_>,
-    occupied_route_sinks: &HashMap<(usize, usize, WireId), RouteSinkOwner>,
+    occupied_route_sinks: &HashMap<RouteNode, RouteSinkOwner>,
     occupied_route_nodes: &HashMap<RouteNode, RouteNodeOwner>,
+    search: &mut SearchScratch<GuidedRouteNode, (usize, WireId)>,
     spec: &SinkRouteSpec<'_>,
 ) -> Option<SinkRoutePath> {
     if !spec.ordered_guide.is_active()
@@ -600,8 +639,9 @@ fn route_sink_following_guide(
         return None;
     }
 
-    let (frontier, best_cost) =
-        seed_search(ordered_start_nodes(spec).into_iter().flat_map(|node| {
+    seed_search(
+        search,
+        ordered_start_nodes(spec).into_iter().flat_map(|node| {
             let start_cost = spec.tree_start_costs.get(&node).copied().unwrap_or(0);
             spec.ordered_guide
                 .indices_for_tile((node.x, node.y))
@@ -617,13 +657,13 @@ fn route_sink_following_guide(
                         (guided.guide_index, guided.node.wire),
                     )
                 })
-        }));
+        }),
+    );
 
     run_search(
         context,
         spec,
-        frontier,
-        best_cost,
+        search,
         |guided| {
             guided.guide_index == spec.ordered_guide.last_index()
                 && guided.node.x == spec.sink_x
@@ -679,21 +719,24 @@ fn route_sink_following_guide(
 
 fn route_sink_with_policy(
     context: &RouteSinkContext<'_>,
-    occupied_route_sinks: &HashMap<(usize, usize, WireId), RouteSinkOwner>,
+    occupied_route_sinks: &HashMap<RouteNode, RouteSinkOwner>,
     occupied_route_nodes: &HashMap<RouteNode, RouteNodeOwner>,
+    search: &mut SearchScratch<RouteNode, WireId>,
     spec: &SinkRouteSpec<'_>,
     max_guide_distance: Option<usize>,
 ) -> Option<SinkRoutePath> {
-    let (frontier, best_cost) = seed_search(ordered_start_nodes(spec).into_iter().map(|node| {
-        let start_cost = spec.tree_start_costs.get(&node).copied().unwrap_or(0);
-        (node, start_cost, start_cost, node.wire)
-    }));
+    seed_search(
+        search,
+        ordered_start_nodes(spec).into_iter().map(|node| {
+            let start_cost = spec.tree_start_costs.get(&node).copied().unwrap_or(0);
+            (node, start_cost, start_cost, node.wire)
+        }),
+    );
 
     run_search(
         context,
         spec,
-        frontier,
-        best_cost,
+        search,
         |node| {
             node.x == spec.sink_x && node.y == spec.sink_y && spec.sink_wires.contains(&node.wire)
         },
@@ -732,18 +775,35 @@ fn route_sink_with_policy(
 }
 
 fn seed_search<Node, Key>(
+    search: &mut SearchScratch<Node, Key>,
     starts: impl IntoIterator<Item = (Node, usize, usize, Key)>,
-) -> (Vec<SearchState<Node, Key>>, HashMap<Node, usize>)
-where
+) where
     Node: Copy + Eq + Ord + std::hash::Hash,
     Key: Copy + Ord,
 {
-    let mut frontier = Vec::new();
-    let mut best_cost = HashMap::new();
+    let starts = starts.into_iter();
+    let (lower, upper) = starts.size_hint();
+    let reserve = upper.unwrap_or(lower);
+    search.frontier.clear();
+    search.best_cost.clear();
+    search.parent.clear();
+    if search.frontier.capacity() < reserve {
+        search
+            .frontier
+            .reserve(reserve - search.frontier.capacity());
+    }
+    if search.best_cost.capacity() < reserve {
+        search
+            .best_cost
+            .reserve(reserve - search.best_cost.capacity());
+    }
+    if search.parent.capacity() < reserve {
+        search.parent.reserve(reserve - search.parent.capacity());
+    }
     for (node, cost, priority, key) in starts {
-        let order = frontier.len();
+        let order = search.frontier.len();
         frontier_heap_push(
-            &mut frontier,
+            &mut search.frontier,
             SearchState {
                 cost,
                 priority,
@@ -752,16 +812,14 @@ where
                 node,
             },
         );
-        best_cost.entry(node).or_insert(cost);
+        search.best_cost.entry(node).or_insert(cost);
     }
-    (frontier, best_cost)
 }
 
 fn run_search<Node, Key>(
     context: &RouteSinkContext<'_>,
     spec: &SinkRouteSpec<'_>,
-    mut frontier: Vec<SearchState<Node, Key>>,
-    mut best_cost: HashMap<Node, usize>,
+    search: &mut SearchScratch<Node, Key>,
     is_goal: impl Fn(Node) -> bool,
     route_node_of: impl Fn(Node) -> RouteNode + Copy,
     mut expand: impl FnMut(
@@ -773,10 +831,12 @@ where
     Node: Copy + Eq + Ord + std::hash::Hash,
     Key: Copy + Ord,
 {
-    let mut parent = HashMap::<Node, SearchParentStep<Node>>::new();
+    let frontier = &mut search.frontier;
+    let best_cost = &mut search.best_cost;
+    let parent = &mut search.parent;
     let mut next_order = frontier.len();
 
-    while let Some(state) = frontier_heap_pop(&mut frontier) {
+    while let Some(state) = frontier_heap_pop(frontier) {
         if is_goal(state.node) {
             return Some(reconstruct_search_path(
                 context,
@@ -811,7 +871,7 @@ where
                 },
             );
             frontier_heap_push(
-                &mut frontier,
+                frontier,
                 SearchState {
                     cost,
                     priority,
@@ -841,8 +901,8 @@ fn reconstruct_search_path<Node: Copy>(
         };
         let current_node = route_node_of(current);
         if let Some(arc_index) = local_arc
-            && let Some(tile) = route_context_for_node(context.arch, context.cil, &current_node)
-            && let Some(graph) = tile.graph(context.graphs)
+            && let Some(tile) = context.tile_context(&current_node)
+            && let Some(graph) = tile.graph
             && let Some(arc) = graph.arcs.get(arc_index)
         {
             reversed.push(RoutedPip {
@@ -866,10 +926,8 @@ fn reconstruct_search_path<Node: Copy>(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::{HashMap, HashSet},
-        path::PathBuf,
-    };
+    use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+    use std::path::PathBuf;
 
     use crate::{
         cil::load_cil,
@@ -923,7 +981,7 @@ mod tests {
         let other_wire = wires.intern("OTHER");
         let current = RouteNode::new(7, 9, current_wire);
         let neighbor = RouteNode::new(7, 9, neighbor_wire);
-        let mut occupied = HashMap::new();
+        let mut occupied = HashMap::default();
 
         assert!(route_sink_is_available(
             &occupied,
@@ -935,7 +993,7 @@ mod tests {
         ));
 
         occupied.insert(
-            (7, 9, neighbor_wire),
+            RouteNode::new(7, 9, neighbor_wire),
             RouteSinkOwner {
                 net_index: 1,
                 origin: NetOrigin::Logical,
@@ -952,7 +1010,7 @@ mod tests {
         ));
 
         occupied.insert(
-            (7, 9, neighbor_wire),
+            RouteNode::new(7, 9, neighbor_wire),
             RouteSinkOwner {
                 net_index: 2,
                 origin: NetOrigin::Logical,
@@ -984,14 +1042,16 @@ mod tests {
         let neighbor_wire = wires.intern("GCLK");
         let current = RouteNode::new(34, 27, current_wire);
         let neighbor = RouteNode::new(34, 27, neighbor_wire);
-        let occupied = HashMap::from([(
-            (34, 27, neighbor_wire),
+        let occupied = [(
+            RouteNode::new(34, 27, neighbor_wire),
             RouteSinkOwner {
                 net_index: 0,
                 origin: NetOrigin::SyntheticGclk,
                 from: current_wire,
             },
-        )]);
+        )]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
 
         assert!(route_sink_is_available(
             &occupied,
@@ -1019,14 +1079,16 @@ mod tests {
         let neighbor_wire = wires.intern("GCLK");
         let current = RouteNode::new(34, 27, other_source_wire);
         let neighbor = RouteNode::new(34, 27, neighbor_wire);
-        let occupied = HashMap::from([(
-            (34, 27, neighbor_wire),
+        let occupied = [(
+            RouteNode::new(34, 27, neighbor_wire),
             RouteSinkOwner {
                 net_index: 0,
                 origin: NetOrigin::SyntheticGclk,
                 from: source_wire,
             },
-        )]);
+        )]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
 
         assert!(!route_sink_is_available(
             &occupied,
@@ -1043,8 +1105,10 @@ mod tests {
         let mut wires = WireInterner::default();
         let track = RouteNode::new(5, 7, wires.intern("H6W2"));
         let site_sink = RouteNode::new(5, 7, wires.intern("S0_F_B1"));
-        let occupied = HashMap::from([(track, 0usize), (site_sink, 0usize)]);
-        let tree_nodes = HashSet::new();
+        let occupied = [(track, 0usize), (site_sink, 0usize)]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let tree_nodes = HashSet::default();
         let stitched_components = StitchedComponentDb::default();
 
         assert!(!route_node_is_available(
@@ -1089,14 +1153,16 @@ mod tests {
 
         let upper = RouteNode::new(4, 53, wires.intern("RIGHT_LLH3"));
         let lower = RouteNode::new(4, 5, wires.intern("LLH0"));
-        let tree_nodes = HashSet::new();
+        let tree_nodes = HashSet::default();
 
         assert_eq!(
             components.occupancy_key(&upper),
             components.occupancy_key(&lower)
         );
 
-        let occupied = HashMap::from([(components.occupancy_key(&upper), 0usize)]);
+        let occupied = [(components.occupancy_key(&upper), 0usize)]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
         assert!(!route_node_is_available(
             &components,
             &occupied,
@@ -1150,10 +1216,13 @@ mod tests {
         let far_tree = RouteNode::new(1, 1, wires.intern("FAR"));
         let ordered_guide = OrderedGuide::new(&[]);
         let guide_distances = GuideDistances::new(&crate::resource::Arch::default(), &[]);
-        let tree_nodes = HashSet::from([root, far_tree, near_tree]);
+        let tree_nodes = [root, far_tree, near_tree]
+            .into_iter()
+            .collect::<HashSet<_>>();
         let tree_starts = tree_nodes.clone();
-        let tree_start_costs =
-            HashMap::from([(root, 0usize), (far_tree, 0usize), (near_tree, 0usize)]);
+        let tree_start_costs = [(root, 0usize), (far_tree, 0usize), (near_tree, 0usize)]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
         let sink_wires = [wires.intern("SINK")];
         let spec = SinkRouteSpec {
             net_index: 0,
@@ -1171,7 +1240,10 @@ mod tests {
             sink_wires: &sink_wires,
         };
 
-        assert_eq!(ordered_start_nodes(&spec), vec![near_tree, far_tree, root]);
+        assert_eq!(
+            ordered_start_nodes(&spec).into_vec(),
+            vec![near_tree, far_tree, root]
+        );
     }
 
     #[test]
@@ -1182,10 +1254,13 @@ mod tests {
         let far_tree = RouteNode::new(1, 1, wires.intern("FAR"));
         let ordered_guide = OrderedGuide::new(&[]);
         let guide_distances = GuideDistances::new(&crate::resource::Arch::default(), &[]);
-        let tree_nodes = HashSet::from([root, far_tree, near_tree]);
+        let tree_nodes = [root, far_tree, near_tree]
+            .into_iter()
+            .collect::<HashSet<_>>();
         let tree_starts = tree_nodes.clone();
-        let tree_start_costs =
-            HashMap::from([(root, 0usize), (far_tree, 1usize), (near_tree, 5usize)]);
+        let tree_start_costs = [(root, 0usize), (far_tree, 1usize), (near_tree, 5usize)]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
         let sink_wires = [wires.intern("SINK")];
         let spec = SinkRouteSpec {
             net_index: 0,
@@ -1203,7 +1278,10 @@ mod tests {
             sink_wires: &sink_wires,
         };
 
-        assert_eq!(ordered_start_nodes(&spec), vec![root, far_tree, near_tree]);
+        assert_eq!(
+            ordered_start_nodes(&spec).into_vec(),
+            vec![root, far_tree, near_tree]
+        );
     }
 
     #[test]
@@ -1225,13 +1303,14 @@ mod tests {
         let graphs = load_site_route_graphs(&arch_path, &cil, &mut wires).expect("load graphs");
         let stitch_db = load_tile_stitch_db(&arch_path, &mut wires).expect("load stitch db");
         let stitched_components = build_stitched_components(&stitch_db, &arch, &wires);
+        let tile_cache = super::TileRouteCache::build(&arch, &cil, &graphs);
         let root = RouteNode::new(34, 27, wires.intern("CLKB_GCLK1_PW"));
         let sink_wire = wires.intern("S0_CLK_B");
         let ordered_guide = OrderedGuide::new(&[]);
         let guide_distances = GuideDistances::new(&arch, &[]);
-        let tree_nodes = HashSet::from([root]);
+        let tree_nodes = [root].into_iter().collect::<HashSet<_>>();
         let tree_starts = tree_nodes.clone();
-        let tree_start_costs = HashMap::from([(root, 0usize)]);
+        let tree_start_costs = [(root, 0usize)].into_iter().collect::<HashMap<_, _>>();
         let sink_wires = [sink_wire];
         let spec = SinkRouteSpec {
             net_index: 0,
@@ -1250,15 +1329,20 @@ mod tests {
         };
         let context = super::RouteSinkContext {
             arch: &arch,
-            cil: &cil,
-            graphs: &graphs,
-            stitch_db: &stitch_db,
             stitched_components: &stitched_components,
+            tile_cache: &tile_cache,
             wires: &mut wires,
         };
 
-        let path =
-            super::route_sink_with_policy(&context, &HashMap::new(), &HashMap::new(), &spec, None);
+        let mut search = super::SearchScratch::default();
+        let path = super::route_sink_with_policy(
+            &context,
+            &HashMap::default(),
+            &HashMap::default(),
+            &mut search,
+            &spec,
+            None,
+        );
         let path = path.expect("dedicated clock route");
         let wires_on_path = path
             .nodes

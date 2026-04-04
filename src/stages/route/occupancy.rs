@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::domain::NetOrigin;
 use crate::resource::routing::StitchedComponentDb;
 
 use super::types::{RouteNode, RoutedPip, WireId};
-type RouteWireKey = (usize, usize, WireId);
+type RouteWireKey = RouteNode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RouteSinkOwner {
@@ -15,6 +15,7 @@ pub(super) struct RouteSinkOwner {
 
 pub(super) type RouteNodeOwner = usize;
 
+#[inline(always)]
 pub(super) fn route_sink_is_available(
     occupied_route_sinks: &HashMap<RouteWireKey, RouteSinkOwner>,
     net_index: usize,
@@ -27,7 +28,7 @@ pub(super) fn route_sink_is_available(
         return true;
     };
     occupied_route_sinks
-        .get(&(neighbor.x, neighbor.y, neighbor.wire))
+        .get(neighbor)
         .map(|owner| {
             owner.net_index == net_index
                 || (owner.from == current.wire
@@ -37,6 +38,7 @@ pub(super) fn route_sink_is_available(
         .unwrap_or(true)
 }
 
+#[inline(always)]
 pub(super) fn route_node_is_available(
     stitched_components: &StitchedComponentDb,
     occupied_route_nodes: &HashMap<RouteNode, RouteNodeOwner>,
@@ -62,7 +64,7 @@ pub(super) fn reserve_route_sinks(
 ) {
     for pip in path {
         occupied_route_sinks
-            .entry((pip.x, pip.y, pip.to))
+            .entry(RouteNode::new(pip.x, pip.y, pip.to))
             .or_insert(RouteSinkOwner {
                 net_index,
                 origin: net_origin,
