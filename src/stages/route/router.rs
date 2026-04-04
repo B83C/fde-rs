@@ -111,28 +111,27 @@ pub fn route_device_design(
             .map(|wire| RouteNode::new(driver.x, driver.y, wire))
             .collect::<Vec<_>>();
         let mut tree_nodes = roots.iter().copied().collect::<HashSet<_>>();
+        let mut tree_starts = tree_nodes.clone();
+        let mut tree_start_costs = roots
+            .iter()
+            .copied()
+            .map(|node| (node, 0usize))
+            .collect::<HashMap<_, _>>();
         let mut used_pips = HashSet::<(usize, usize, WireId, WireId)>::new();
 
         let mut sinks = net.sinks.iter().collect::<Vec<_>>();
-        // Prefer same-site cell sinks before remote or port sinks. This keeps
-        // local feedback branches available for later remote sinks instead of
-        // forcing the whole net through the first long-distance escape path.
+        // The sibling C++ router orders sinks by timing criticality rather than
+        // prioritizing same-site loads. We do not have the same per-sink
+        // timing numbers here, so use longer/farther sinks as a deterministic
+        // proxy and let trivial same-site sinks fall later.
         sinks.sort_by_key(|sink| {
-            let sink_class = match resolve_route_endpoint(device, &index, sink) {
-                ResolvedRouteEndpoint::Cell(cell)
-                    if cell.tile_name == driver_cell.tile_name
-                        && cell.site_name == driver_cell.site_name =>
-                {
-                    0u8
-                }
-                ResolvedRouteEndpoint::Cell(_) => 1u8,
-                ResolvedRouteEndpoint::Port(_) => 2u8,
-                ResolvedRouteEndpoint::Unknown => 3u8,
-            };
             (
-                sink_class,
                 std::cmp::Reverse(net.guide_tiles_for_sink(sink).len()),
-                tile_distance(driver.x, driver.y, sink.x, sink.y),
+                std::cmp::Reverse(tile_distance(driver.x, driver.y, sink.x, sink.y)),
+                sink.x,
+                sink.y,
+                sink.name.as_str(),
+                sink.pin.as_str(),
             )
         });
 
@@ -194,6 +193,8 @@ pub fn route_device_design(
                     guide_distances: &guide_distances,
                     roots: &roots,
                     tree_nodes: &tree_nodes,
+                    tree_starts: &tree_starts,
+                    tree_start_costs: &tree_start_costs,
                     sink_x: sink.x,
                     sink_y: sink.y,
                     sink_wires: sink_wires.as_slice(),
@@ -219,6 +220,25 @@ pub fn route_device_design(
                     &mut occupied_route_nodes,
                     net_index,
                     &path.nodes,
+                );
+                if let Some((&start, rest)) = path.nodes.split_first() {
+                    let base_cost = tree_start_costs.get(&start).copied().unwrap_or(0);
+                    for (offset, node) in rest
+                        .iter()
+                        .copied()
+                        .take(rest.len().saturating_sub(1))
+                        .enumerate()
+                    {
+                        tree_start_costs
+                            .entry(node)
+                            .or_insert(base_cost + offset + 1);
+                    }
+                }
+                tree_starts.extend(
+                    path.nodes
+                        .iter()
+                        .copied()
+                        .take(path.nodes.len().saturating_sub(1)),
                 );
                 tree_nodes.extend(path.nodes.iter().copied());
 
@@ -359,18 +379,21 @@ pub(super) struct SinkRouteSpec<'a> {
     pub(super) guide_distances: &'a GuideDistances,
     pub(super) roots: &'a [RouteNode],
     pub(super) tree_nodes: &'a HashSet<RouteNode>,
+    pub(super) tree_starts: &'a HashSet<RouteNode>,
+    pub(super) tree_start_costs: &'a HashMap<RouteNode, usize>,
     pub(super) sink_x: usize,
     pub(super) sink_y: usize,
     pub(super) sink_wires: &'a [WireId],
 }
 
 fn ordered_start_nodes(spec: &SinkRouteSpec<'_>) -> Vec<RouteNode> {
-    let mut nodes = spec.tree_nodes.iter().copied().collect::<Vec<_>>();
+    let mut nodes = spec.tree_starts.iter().copied().collect::<Vec<_>>();
     if nodes.is_empty() {
         nodes.extend_from_slice(spec.roots);
     }
     nodes.sort_by_key(|node| {
         (
+            spec.tree_start_costs.get(node).copied().unwrap_or(0),
             tile_distance(node.x, node.y, spec.sink_x, spec.sink_y),
             node.x,
             node.y,
@@ -449,6 +472,7 @@ fn route_sink_following_guide(
 
     let (frontier, best_cost) =
         seed_search(ordered_start_nodes(spec).into_iter().flat_map(|node| {
+            let start_cost = spec.tree_start_costs.get(&node).copied().unwrap_or(0);
             spec.ordered_guide
                 .indices_for_tile((node.x, node.y))
                 .into_iter()
@@ -456,7 +480,9 @@ fn route_sink_following_guide(
                     let guided = GuidedRouteNode { node, guide_index };
                     (
                         guided,
-                        spec.ordered_guide.remaining_steps(guide_index)
+                        start_cost,
+                        start_cost
+                            + spec.ordered_guide.remaining_steps(guide_index)
                             + tile_distance(node.x, node.y, spec.sink_x, spec.sink_y),
                         (guided.guide_index, guided.node.wire),
                     )
@@ -528,11 +554,10 @@ fn route_sink_with_policy(
     spec: &SinkRouteSpec<'_>,
     max_guide_distance: Option<usize>,
 ) -> Option<SinkRoutePath> {
-    let (frontier, best_cost) = seed_search(
-        ordered_start_nodes(spec)
-            .into_iter()
-            .map(|node| (node, 0, node.wire)),
-    );
+    let (frontier, best_cost) = seed_search(ordered_start_nodes(spec).into_iter().map(|node| {
+        let start_cost = spec.tree_start_costs.get(&node).copied().unwrap_or(0);
+        (node, start_cost, start_cost, node.wire)
+    }));
 
     run_search(
         context,
@@ -577,7 +602,7 @@ fn route_sink_with_policy(
 }
 
 fn seed_search<Node, Key>(
-    starts: impl IntoIterator<Item = (Node, usize, Key)>,
+    starts: impl IntoIterator<Item = (Node, usize, usize, Key)>,
 ) -> (Vec<SearchState<Node, Key>>, HashMap<Node, usize>)
 where
     Node: Copy + Eq + Ord + std::hash::Hash,
@@ -585,19 +610,19 @@ where
 {
     let mut frontier = Vec::new();
     let mut best_cost = HashMap::new();
-    for (node, priority, key) in starts {
+    for (node, cost, priority, key) in starts {
         let order = frontier.len();
         frontier_heap_push(
             &mut frontier,
             SearchState {
-                cost: 0,
+                cost,
                 priority,
                 order,
                 key,
                 node,
             },
         );
-        best_cost.entry(node).or_insert(0);
+        best_cost.entry(node).or_insert(cost);
     }
     (frontier, best_cost)
 }
@@ -996,6 +1021,9 @@ mod tests {
         let ordered_guide = OrderedGuide::new(&[]);
         let guide_distances = GuideDistances::new(&crate::resource::Arch::default(), &[]);
         let tree_nodes = HashSet::from([root, far_tree, near_tree]);
+        let tree_starts = tree_nodes.clone();
+        let tree_start_costs =
+            HashMap::from([(root, 0usize), (far_tree, 0usize), (near_tree, 0usize)]);
         let sink_wires = [wires.intern("SINK")];
         let spec = SinkRouteSpec {
             net_index: 0,
@@ -1006,12 +1034,46 @@ mod tests {
             guide_distances: &guide_distances,
             roots: &[root],
             tree_nodes: &tree_nodes,
+            tree_starts: &tree_starts,
+            tree_start_costs: &tree_start_costs,
             sink_x: 5,
             sink_y: 5,
             sink_wires: &sink_wires,
         };
 
         assert_eq!(ordered_start_nodes(&spec), vec![near_tree, far_tree, root]);
+    }
+
+    #[test]
+    fn ordered_start_nodes_prefer_lower_tree_cost_over_nearer_frontier() {
+        let mut wires = WireInterner::default();
+        let root = RouteNode::new(0, 0, wires.intern("ROOT"));
+        let near_tree = RouteNode::new(4, 4, wires.intern("NEAR"));
+        let far_tree = RouteNode::new(1, 1, wires.intern("FAR"));
+        let ordered_guide = OrderedGuide::new(&[]);
+        let guide_distances = GuideDistances::new(&crate::resource::Arch::default(), &[]);
+        let tree_nodes = HashSet::from([root, far_tree, near_tree]);
+        let tree_starts = tree_nodes.clone();
+        let tree_start_costs =
+            HashMap::from([(root, 0usize), (far_tree, 1usize), (near_tree, 5usize)]);
+        let sink_wires = [wires.intern("SINK")];
+        let spec = SinkRouteSpec {
+            net_index: 0,
+            net_origin: NetOrigin::Logical,
+            net_kind: super::RouteNetKind::Generic,
+            strict_clock_sink: false,
+            ordered_guide: &ordered_guide,
+            guide_distances: &guide_distances,
+            roots: &[root],
+            tree_nodes: &tree_nodes,
+            tree_starts: &tree_starts,
+            tree_start_costs: &tree_start_costs,
+            sink_x: 5,
+            sink_y: 5,
+            sink_wires: &sink_wires,
+        };
+
+        assert_eq!(ordered_start_nodes(&spec), vec![root, far_tree, near_tree]);
     }
 
     #[test]
@@ -1038,6 +1100,8 @@ mod tests {
         let ordered_guide = OrderedGuide::new(&[]);
         let guide_distances = GuideDistances::new(&arch, &[]);
         let tree_nodes = HashSet::from([root]);
+        let tree_starts = tree_nodes.clone();
+        let tree_start_costs = HashMap::from([(root, 0usize)]);
         let sink_wires = [sink_wire];
         let spec = SinkRouteSpec {
             net_index: 0,
@@ -1048,6 +1112,8 @@ mod tests {
             guide_distances: &guide_distances,
             roots: &[root],
             tree_nodes: &tree_nodes,
+            tree_starts: &tree_starts,
+            tree_start_costs: &tree_start_costs,
             sink_x: 3,
             sink_y: 31,
             sink_wires: &sink_wires,
