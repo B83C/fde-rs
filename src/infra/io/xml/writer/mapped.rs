@@ -282,17 +282,23 @@ mod tests {
             feedback.driver.as_ref().map(|driver| driver.name.as_str()),
             Some("id00001")
         );
-        assert!(feedback
-            .sinks
-            .iter()
-            .any(|sink| sink.name == "Buf-pad-led" && sink.pin == "I"));
-        assert!(feedback
-            .sinks
-            .iter()
-            .any(|sink| sink.name == "id00002" && sink.pin == "ADR0"));
-        assert!(feedback
-            .sinks
-            .iter()
-            .any(|sink| sink.name == "id00002" && sink.pin == "ADR1"));
+        assert!(
+            feedback
+                .sinks
+                .iter()
+                .any(|sink| sink.name == "Buf-pad-led" && sink.pin == "I")
+        );
+        assert!(
+            feedback
+                .sinks
+                .iter()
+                .any(|sink| sink.name == "id00002" && sink.pin == "ADR0")
+        );
+        assert!(
+            feedback
+                .sinks
+                .iter()
+                .any(|sink| sink.name == "id00002" && sink.pin == "ADR1")
+        );
     }
 }

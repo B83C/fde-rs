@@ -299,8 +299,7 @@ fn exact_clock_routing_connects_gclk_pad_into_global_buffer_when_resources_are_a
 }
 
 #[test]
-fn exact_logical_clock_routing_uses_cpp_compatible_clock_branch_wires_when_needed()
--> Result<()> {
+fn exact_logical_clock_routing_uses_cpp_compatible_clock_branch_wires_when_needed() -> Result<()> {
     let Some(bundle) = crate::resource::ResourceBundle::discover_from(&repo_root()).ok() else {
         return Ok(());
     };

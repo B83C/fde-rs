@@ -212,8 +212,14 @@ mod tests {
 
     #[test]
     fn decodes_constant_expression_literals_emitted_by_cpp_physical_xml() {
-        assert_eq!(decode_lut_function("#LUT:D=0"), Some(("0x0".to_string(), 4)));
-        assert_eq!(decode_lut_function("#LUT:D=1"), Some(("0x1".to_string(), 4)));
+        assert_eq!(
+            decode_lut_function("#LUT:D=0"),
+            Some(("0x0".to_string(), 4))
+        );
+        assert_eq!(
+            decode_lut_function("#LUT:D=1"),
+            Some(("0x1".to_string(), 4))
+        );
     }
 
     #[test]

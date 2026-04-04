@@ -1071,19 +1071,19 @@ mod tests {
         let design = load_fde_physical_design_xml(document.root_element())
             .expect("physical import should succeed");
 
-        assert!(
-            design
-                .cells
-                .iter()
-                .any(|cell| cell.name == "iSlice__0__::lut1" && cell.property("lut_init") == Some("0x0"))
-        );
+        assert!(design.cells.iter().any(
+            |cell| cell.name == "iSlice__0__::lut1" && cell.property("lut_init") == Some("0x0")
+        ));
         let led_net = design
             .nets
             .iter()
             .find(|net| net.name == "led")
             .expect("logical led net");
         assert_eq!(
-            led_net.driver.as_ref().map(|endpoint| endpoint.name.as_str()),
+            led_net
+                .driver
+                .as_ref()
+                .map(|endpoint| endpoint.name.as_str()),
             Some("iSlice__0__::lut1")
         );
     }

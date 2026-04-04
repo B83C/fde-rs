@@ -34,13 +34,8 @@ pub(super) fn build_port_bindings(
                 None if clock_input => "gclkiob",
                 None => "iob",
             };
-            let fallback_position = port
-                .x
-                .zip(port.y)
-                .map(|(x, y)| (x, y, port.z.unwrap_or(0)));
-            let pad_position = pad
-                .map(|pad| (pad.x, pad.y, pad.z))
-                .or(fallback_position);
+            let fallback_position = port.x.zip(port.y).map(|(x, y)| (x, y, port.z.unwrap_or(0)));
+            let pad_position = pad.map(|pad| (pad.x, pad.y, pad.z)).or(fallback_position);
             let gclk_instance_name = if clock_input && pad_module_ref == "gclkiob" {
                 let name = format!("iGclk_buf__{clock_port_index}__");
                 clock_port_index += 1;

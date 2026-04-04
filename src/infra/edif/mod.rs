@@ -1053,7 +1053,7 @@ fn indexed_name(base: &str, index: usize) -> String {
 }
 
 fn parse_bus_range_name(name: &str) -> Option<(String, ArrayRange)> {
-    let (open, close) = [('[' , ']'), ('(', ')'), ('<', '>')]
+    let (open, close) = [('[', ']'), ('(', ')'), ('<', '>')]
         .into_iter()
         .find(|(open, close)| name.ends_with(*close) && name.contains(*open))?;
     let split = name.rfind(open)?;
