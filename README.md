@@ -129,6 +129,8 @@ A normal implementation run emits:
 05-timing.rpt
 06-output.bit
 report.json
+summary.rpt
+run.log
 ```
 
 For debug-oriented inspection, add `--emit-sidecar` to also write:
@@ -175,6 +177,56 @@ cargo run --bin fde -- bitgen --input build/04-routed.xml --output build/06-outp
   --cil resources/hw_lib/fdp3p7_cil.xml \
   --emit-sidecar
 ```
+
+## Releases
+
+Tag-driven releases are automated through GitHub Actions.
+
+### Recommended release flow
+
+1. Update `Cargo.toml` to the version you want to ship.
+2. Run the normal quality bar locally:
+
+```bash
+cargo fmt --all -- --check && \
+cargo check --locked --all-targets && \
+cargo clippy --locked --all-targets --all-features -- -D warnings && \
+cargo test --locked --quiet
+```
+
+3. Create and push the release tag:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+That tag triggers `.github/workflows/release.yml`, which:
+
+- verifies the tag matches `Cargo.toml`
+- reruns the quality bar plus a release smoke test
+- runs `cargo publish --dry-run`
+- builds release binaries for Linux, macOS, and Windows
+- packages each binary together with `resources/hw_lib`, `README.md`, `LICENSE`, and `BUILD_INFO.txt`
+- generates `SHA256SUMS`
+- publishes a GitHub Release automatically
+
+### crates.io publishing
+
+The same release workflow can also publish to crates.io, but it is intentionally
+**gated** rather than always-on.
+
+To enable it safely:
+
+1. add the repository secret `CARGO_REGISTRY_TOKEN`
+2. add the repository variable `ENABLE_CRATES_RELEASE=true`
+3. create the GitHub environment `crates-io`
+4. enable required reviewers on that environment
+
+With that configuration in place, a release tag will publish GitHub assets
+automatically and then pause for manual approval before running `cargo publish`.
+
+If you want the GitHub Release only, do nothing: the crates.io job stays off by default.
 
 ## Frontend model: synthesize with Yosys first
 

@@ -42,6 +42,8 @@ This repository is the standalone Rust 2024 implementation flow for FDE.
 - In-repo board probe: `cargo run --manifest-path tools/wave_probe/Cargo.toml -- <bitstream>`
 - Main help: `cargo run --bin fde -- --help`
 - End-to-end smoke: `cargo run --bin fde -- impl --input examples/blinky/blinky.edf --constraints examples/blinky/constraints.xml --resource-root tests/fixtures/hw_lib --out-dir build/blinky-run`
+- Package dry run: `cargo publish --locked --dry-run`
+- Tag release: `git tag vX.Y.Z && git push origin vX.Y.Z`
 
 ## Editing Guidance
 
@@ -49,6 +51,8 @@ This repository is the standalone Rust 2024 implementation flow for FDE.
 - Prefer small stage-focused modules over broad refactors that blur responsibilities.
 - Do not silently swallow missing resource/config inputs; either derive a safe default or surface a clear error.
 - When adding new tooling, update this file and `README.md` in the same change.
+- The tag-driven release workflow lives in `.github/workflows/release.yml`; keep `Cargo.toml` version, release tag, and release documentation aligned.
+- Release archives are expected to bundle `resources/hw_lib` next to the `fde` binary so prebuilt downloads remain runnable without extra setup.
 - Keep checked-in board regression netlists in EDF form under `examples/board-e2e/`; do not commit temporary synthesis-only Verilog there.
 - Keep board-specific long-cycle probe overrides in `examples/board-e2e/manifest.json` so regressions remain reproducible from the checked-in manifest.
 - Keep string handling at parsing and reporting boundaries; do not add new raw string branching in core stage logic when a typed enum or helper can model it.

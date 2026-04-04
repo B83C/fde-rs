@@ -57,6 +57,8 @@ jobs:
           test -f "${out_dir}/05-timing.rpt"
           test -f "${out_dir}/06-output.bit"
           test -f "${out_dir}/report.json"
+          test -f "${out_dir}/summary.rpt"
+          test -f "${out_dir}/run.log"
 
       - name: Board EDF dry run
         shell: bash
@@ -73,6 +75,8 @@ jobs:
               --out-dir "${out_dir}"
             test -f "${out_dir}/06-output.bit"
             test -f "${out_dir}/report.json"
+            test -f "${out_dir}/summary.rpt"
+            test -f "${out_dir}/run.log"
           done
 
       - name: Upload smoke artifacts

@@ -1,0 +1,317 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (for example v1.0.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  verify-release:
+    name: Verify release metadata
+    runs-on: ubuntu-latest
+
+    outputs:
+      tag_name: ${{ steps.meta.outputs.tag_name }}
+      version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve tag and crate version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            tag_name="${{ github.event.inputs.tag }}"
+          else
+            tag_name="${GITHUB_REF_NAME}"
+          fi
+          version="$(python - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path("Cargo.toml").read_text()
+          match = re.search(r'^version = "(?P<version>[^"]+)"$', text, re.MULTILINE)
+          if not match:
+              raise SystemExit("Cargo.toml is missing a package version")
+          print(match.group("version"))
+          PY
+          )"
+          expected_tag="v${version}"
+          if [[ "${tag_name}" != "${expected_tag}" ]]; then
+            echo "tag ${tag_name} does not match Cargo.toml version ${version}" >&2
+            exit 1
+          fi
+          echo "tag_name=${tag_name}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Cargo check
+        run: cargo check --locked --all-targets
+
+      - name: Cargo clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Cargo test
+        run: cargo test --locked --quiet
+
+      - name: End-to-end smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          out_dir="${RUNNER_TEMP}/blinky-run"
+          cargo run --locked --quiet --bin fde -- impl \
+            --input examples/blinky/blinky.edf \
+            --constraints examples/blinky/constraints.xml \
+            --resource-root resources/hw_lib \
+            --out-dir "${out_dir}"
+          test -f "${out_dir}/04-routed.xml"
+          test -f "${out_dir}/05-timing.rpt"
+          test -f "${out_dir}/06-output.bit"
+          test -f "${out_dir}/report.json"
+          test -f "${out_dir}/summary.rpt"
+          test -f "${out_dir}/run.log"
+
+      - name: Board EDF dry run
+        shell: bash
+        run: |
+          set -euo pipefail
+          find examples/board-e2e -mindepth 2 -maxdepth 2 -name '*.edf' | sort | while read -r edf; do
+            case_dir=$(dirname "${edf}")
+            name=$(basename "${case_dir}")
+            out_dir="${RUNNER_TEMP}/board-e2e/${name}"
+            cargo run --locked --quiet --bin fde -- impl \
+              --input "${edf}" \
+              --constraints "${case_dir}/constraints.xml" \
+              --resource-root resources/hw_lib \
+              --out-dir "${out_dir}"
+            test -f "${out_dir}/06-output.bit"
+            test -f "${out_dir}/report.json"
+            test -f "${out_dir}/summary.rpt"
+            test -f "${out_dir}/run.log"
+          done
+
+      - name: Cargo publish dry run
+        run: cargo publish --locked --dry-run
+
+  build-release-assets:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    needs: verify-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary_name: fde
+            archive_ext: tar.gz
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary_name: fde
+            archive_ext: tar.gz
+          - label: macos-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary_name: fde
+            archive_ext: tar.gz
+          - label: macos-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            binary_name: fde
+            archive_ext: tar.gz
+          - label: windows-x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary_name: fde.exe
+            archive_ext: zip
+          - label: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary_name: fde.exe
+            archive_ext: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --locked --release --bin fde
+
+      - name: Package release archive
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.verify-release.outputs.tag_name }}
+          RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
+          TARGET_TRIPLE: ${{ matrix.target }}
+          BINARY_NAME: ${{ matrix.binary_name }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import shutil
+          import tarfile
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          release_tag = os.environ["RELEASE_TAG"]
+          release_version = os.environ["RELEASE_VERSION"]
+          target = os.environ["TARGET_TRIPLE"]
+          binary_name = os.environ["BINARY_NAME"]
+          archive_ext = os.environ["ARCHIVE_EXT"]
+
+          project = "fde-rs"
+          archive_base = f"fde-{release_tag}-{target}"
+          payload_root = Path("dist") / archive_base
+          payload_root.mkdir(parents=True, exist_ok=True)
+
+          binary_src = Path("target") / "release" / binary_name
+          if not binary_src.is_file():
+              raise SystemExit(f"missing built binary: {binary_src}")
+
+          shutil.copy2(binary_src, payload_root / binary_name)
+          shutil.copy2("README.md", payload_root / "README.md")
+          shutil.copy2("LICENSE", payload_root / "LICENSE")
+          shutil.copytree("resources/hw_lib", payload_root / "resources" / "hw_lib", dirs_exist_ok=True)
+
+          built_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          build_info = payload_root / "BUILD_INFO.txt"
+          build_info.write_text(
+              "\n".join(
+                  [
+                      f"project={project}",
+                      f"version={release_version}",
+                      f"tag={release_tag}",
+                      f"binary={binary_name}",
+                      f"target={target}",
+                      f"git_sha={os.environ['GITHUB_SHA']}",
+                      f"git_ref={os.environ['GITHUB_REF']}",
+                      f"workflow_run={os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+                      f"built_at={built_at}",
+                  ]
+              )
+              + "\n"
+          )
+
+          archive_path = Path("dist") / f"{archive_base}.{archive_ext}"
+          if archive_ext == "zip":
+              with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                  for path in sorted(payload_root.rglob("*")):
+                      if path.is_file():
+                          zf.write(path, path.relative_to(payload_root.parent))
+          else:
+              with tarfile.open(archive_path, "w:gz") as tf:
+                  tf.add(payload_root, arcname=payload_root.name)
+
+          print(f"created {archive_path}")
+          PY
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/fde-${{ needs.verify-release.outputs.tag_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+  publish-github-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - verify-release
+      - build-release-assets
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          root = Path("release-assets")
+          files = sorted(path for path in root.iterdir() if path.is_file())
+          manifest = root / "SHA256SUMS"
+          with manifest.open("w") as fh:
+              for path in files:
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  fh.write(f"{digest}  {path.name}\n")
+          PY
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.verify-release.outputs.tag_name }}
+          generate_release_notes: true
+          files: |
+            release-assets/*
+
+  publish-crates:
+    name: Publish crates.io package
+    runs-on: ubuntu-latest
+    needs:
+      - verify-release
+      - publish-github-release
+    if: ${{ vars.ENABLE_CRATES_RELEASE == 'true' && secrets.CARGO_REGISTRY_TOKEN != '' }}
+    environment:
+      name: crates-io
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Publish crate
+        run: cargo publish --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
