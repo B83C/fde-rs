@@ -73,6 +73,19 @@ struct EvaluationState {
     metrics: PlacementMetrics,
 }
 
+struct CandidateNetEffects {
+    wire_cost: f64,
+    timing_cost: f64,
+    congestion_score_raw: f64,
+    load_deltas: Vec<(usize, f64)>,
+    net_updates: Vec<(usize, Option<NetModel>)>,
+}
+
+struct CandidateLocalityEffects {
+    cost: f64,
+    updates: Vec<(ClusterId, f64)>,
+}
+
 impl<'a> PlacementEvaluator<'a> {
     pub(crate) fn new_from_positions(
         model: &'a PlacementModel,
@@ -112,119 +125,28 @@ impl<'a> PlacementEvaluator<'a> {
     where
         P: Copy + Into<Point>,
     {
-        let updates = updates
-            .iter()
-            .map(|(cluster_id, point)| (*cluster_id, (*point).into()))
-            .collect::<SmallVec<[(ClusterId, Point); 2]>>();
+        let updates = normalize_candidate_updates(updates);
         if updates.is_empty() {
-            return PlacementCandidate {
-                updates: SmallVec::new(),
-                net_updates: Vec::new(),
-                load_deltas: Vec::new(),
-                locality_updates: Vec::new(),
-                metrics: self.metrics.clone(),
-            };
+            return self.empty_candidate();
         }
 
-        let moved_clusters = updates
-            .iter()
-            .map(|(cluster_id, _)| *cluster_id)
-            .collect::<Vec<_>>();
-        let affected_nets = affected_nets(self.model, &moved_clusters);
-        let affected_clusters = affected_locality_clusters(self.graph, &moved_clusters);
-
-        let mut wire_cost = self.metrics.wire_cost;
-        let mut timing_cost = self.metrics.timing_cost;
-        let mut congestion_score_raw = self.congestion_score_raw;
-        let mut locality_cost = self.metrics.locality_cost;
-        let mut load_deltas = vec![0.0; self.loads.len()];
-        let mut touched_loads = Vec::new();
-        let mut touched_mask = vec![false; self.loads.len()];
-        let mut net_updates = Vec::with_capacity(affected_nets.len());
-
-        for net_index in affected_nets {
-            if let Some(previous) = self.net_models.get(net_index).and_then(Option::as_ref) {
-                wire_cost -= previous.wire_cost();
-                timing_cost -= previous.timing_cost();
-                accumulate_load_delta(
-                    previous,
-                    self.arch,
-                    -1.0,
-                    &mut load_deltas,
-                    &mut touched_loads,
-                    &mut touched_mask,
-                );
-            }
-
-            let next_model = self.model.nets.get(net_index).and_then(|net| {
-                build_net_model_with_overrides(
-                    net,
-                    self.model,
-                    &self.placements,
-                    &updates,
-                    self.delay,
-                    self.mode,
-                )
-            });
-            if let Some(next) = next_model.as_ref() {
-                wire_cost += next.wire_cost();
-                timing_cost += next.timing_cost();
-                accumulate_load_delta(
-                    next,
-                    self.arch,
-                    1.0,
-                    &mut load_deltas,
-                    &mut touched_loads,
-                    &mut touched_mask,
-                );
-            }
-            net_updates.push((net_index, next_model));
-        }
-
-        for index in &touched_loads {
-            let previous = self.loads.get(*index).copied().unwrap_or(0.0);
-            let next = previous + load_deltas[*index];
-            congestion_score_raw += overflow_score(next) - overflow_score(previous);
-        }
-
-        let mut locality_updates = Vec::with_capacity(affected_clusters.len());
-        for cluster_id in affected_clusters {
-            let previous = self
-                .locality_terms
-                .get(cluster_id.index())
-                .copied()
-                .unwrap_or(0.0);
-            let next = locality_term(
-                cluster_id,
-                self.graph,
-                &self.placements,
-                &updates,
-                &self.locality_weights,
-            )
-            .unwrap_or(0.0);
-            locality_cost += next - previous;
-            locality_updates.push((cluster_id, next));
-        }
+        let moved_clusters = moved_clusters(&updates);
+        let net_effects = self.candidate_net_effects(&updates, &moved_clusters);
+        let locality_effects = self.candidate_locality_effects(&updates, &moved_clusters);
 
         let metrics = compose_metrics(
             self.mode,
-            wire_cost,
-            congestion_score_raw,
-            timing_cost,
-            locality_cost,
+            net_effects.wire_cost,
+            net_effects.congestion_score_raw,
+            net_effects.timing_cost,
+            locality_effects.cost,
         );
 
         PlacementCandidate {
-            updates: updates.iter().copied().collect(),
-            net_updates,
-            load_deltas: touched_loads
-                .into_iter()
-                .filter_map(|index| {
-                    let delta = load_deltas[index];
-                    (delta.abs() > f64::EPSILON).then_some((index, delta))
-                })
-                .collect(),
-            locality_updates,
+            updates,
+            net_updates: net_effects.net_updates,
+            load_deltas: net_effects.load_deltas,
+            locality_updates: locality_effects.updates,
             metrics,
         }
     }
@@ -256,6 +178,123 @@ impl<'a> PlacementEvaluator<'a> {
 
         self.congestion_score_raw = candidate.metrics.congestion_cost / CONGESTION_SCALE;
         self.metrics = candidate.metrics;
+    }
+
+    fn empty_candidate(&self) -> PlacementCandidate {
+        PlacementCandidate {
+            updates: SmallVec::new(),
+            net_updates: Vec::new(),
+            load_deltas: Vec::new(),
+            locality_updates: Vec::new(),
+            metrics: self.metrics.clone(),
+        }
+    }
+
+    fn candidate_net_effects(
+        &self,
+        updates: &ClusterUpdates,
+        moved_clusters: &[ClusterId],
+    ) -> CandidateNetEffects {
+        let affected_nets = affected_nets(self.model, moved_clusters);
+        let mut wire_cost = self.metrics.wire_cost;
+        let mut timing_cost = self.metrics.timing_cost;
+        let mut congestion_score_raw = self.congestion_score_raw;
+        let mut load_deltas = vec![0.0; self.loads.len()];
+        let mut touched_loads = Vec::new();
+        let mut touched_mask = vec![false; self.loads.len()];
+        let mut net_updates = Vec::with_capacity(affected_nets.len());
+
+        for net_index in affected_nets {
+            if let Some(previous) = self.net_models.get(net_index).and_then(Option::as_ref) {
+                wire_cost -= previous.wire_cost();
+                timing_cost -= previous.timing_cost();
+                accumulate_load_delta(
+                    previous,
+                    self.arch,
+                    -1.0,
+                    &mut load_deltas,
+                    &mut touched_loads,
+                    &mut touched_mask,
+                );
+            }
+
+            let next_model = self.model.nets.get(net_index).and_then(|net| {
+                build_net_model_with_overrides(
+                    net,
+                    self.model,
+                    &self.placements,
+                    updates,
+                    self.delay,
+                    self.mode,
+                )
+            });
+            if let Some(next) = next_model.as_ref() {
+                wire_cost += next.wire_cost();
+                timing_cost += next.timing_cost();
+                accumulate_load_delta(
+                    next,
+                    self.arch,
+                    1.0,
+                    &mut load_deltas,
+                    &mut touched_loads,
+                    &mut touched_mask,
+                );
+            }
+            net_updates.push((net_index, next_model));
+        }
+
+        for index in &touched_loads {
+            let previous = self.loads.get(*index).copied().unwrap_or(0.0);
+            let next = previous + load_deltas[*index];
+            congestion_score_raw += overflow_score(next) - overflow_score(previous);
+        }
+
+        CandidateNetEffects {
+            wire_cost,
+            timing_cost,
+            congestion_score_raw,
+            load_deltas: touched_loads
+                .into_iter()
+                .filter_map(|index| {
+                    let delta = load_deltas[index];
+                    (delta.abs() > f64::EPSILON).then_some((index, delta))
+                })
+                .collect(),
+            net_updates,
+        }
+    }
+
+    fn candidate_locality_effects(
+        &self,
+        updates: &ClusterUpdates,
+        moved_clusters: &[ClusterId],
+    ) -> CandidateLocalityEffects {
+        let affected_clusters = affected_locality_clusters(self.graph, moved_clusters);
+        let mut cost = self.metrics.locality_cost;
+        let mut updates_out = Vec::with_capacity(affected_clusters.len());
+
+        for cluster_id in affected_clusters {
+            let previous = self
+                .locality_terms
+                .get(cluster_id.index())
+                .copied()
+                .unwrap_or(0.0);
+            let next = locality_term(
+                cluster_id,
+                self.graph,
+                &self.placements,
+                updates,
+                &self.locality_weights,
+            )
+            .unwrap_or(0.0);
+            cost += next - previous;
+            updates_out.push((cluster_id, next));
+        }
+
+        CandidateLocalityEffects {
+            cost,
+            updates: updates_out,
+        }
     }
 }
 
@@ -290,6 +329,20 @@ pub(crate) fn evaluate_positions(
     build_evaluation_state(model, graph, placements, arch, delay, mode)
         .metrics
         .clone()
+}
+
+fn normalize_candidate_updates<P>(updates: &[(ClusterId, P)]) -> ClusterUpdates
+where
+    P: Copy + Into<Point>,
+{
+    updates
+        .iter()
+        .map(|(cluster_id, point)| (*cluster_id, (*point).into()))
+        .collect()
+}
+
+fn moved_clusters(updates: &ClusterUpdates) -> Vec<ClusterId> {
+    updates.iter().map(|(cluster_id, _)| *cluster_id).collect()
 }
 
 fn build_evaluation_state(

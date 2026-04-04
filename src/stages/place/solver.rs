@@ -41,6 +41,19 @@ struct SolveContext<'a> {
     movable_mask: &'a [bool],
 }
 
+struct IncrementalAnnealState<'a> {
+    evaluator: PlacementEvaluator<'a>,
+    occupancy: OccupancyMap,
+    metrics: PlacementMetrics,
+}
+
+struct FullAnnealState {
+    current: Vec<Option<Point>>,
+    trial: Vec<Option<Point>>,
+    occupancy: OccupancyMap,
+    metrics: PlacementMetrics,
+}
+
 pub(crate) fn solve(
     design: &crate::ir::Design,
     options: &PlaceOptions,
@@ -122,9 +135,8 @@ fn solve_internal(
     }
 }
 
-fn solve_incremental(context: &SolveContext<'_>) -> Result<PlacementSolution> {
-    let mut rng = ChaCha8Rng::seed_from_u64(context.options.seed);
-    let current = initial_placement(
+fn initial_positions(context: &SolveContext<'_>) -> Result<Vec<Option<Point>>> {
+    initial_placement(
         context.design,
         context.graph,
         context.model,
@@ -134,91 +146,230 @@ fn solve_incremental(context: &SolveContext<'_>) -> Result<PlacementSolution> {
         context.options.arch.width,
         context.options.arch.height,
         context.options.arch.slices_per_tile.max(1),
-    )?;
-    let mut evaluator = PlacementEvaluator::new_from_positions(
+    )
+}
+
+fn anneal_iterations(context: &SolveContext<'_>) -> usize {
+    700 + context.movable.len() * 50
+}
+
+fn anneal_temperature(total_cost: f64, movable_count: usize) -> f64 {
+    (total_cost / movable_count.max(1) as f64).max(0.5)
+}
+
+fn cool_temperature(temperature: f64, step: usize) -> f64 {
+    let cooled = temperature
+        * if step.is_multiple_of(40) {
+            0.985
+        } else {
+            0.9985
+        };
+    cooled.max(0.02)
+}
+
+fn stall_limit(context: &SolveContext<'_>) -> usize {
+    context.movable.len() * 3
+}
+
+fn choose_focus_and_targets(
+    context: &SolveContext<'_>,
+    placements: &[Option<Point>],
+    focus_weights: &[(ClusterId, f64)],
+    rng: &mut ChaCha8Rng,
+) -> Result<(ClusterId, CandidateTargets)> {
+    let focus = choose_focus(focus_weights, rng)
+        .ok_or_else(|| anyhow!("missing movable cluster during placement"))?;
+    let targets = candidate_targets(
+        focus,
         context.model,
         context.graph,
-        current,
+        placements,
+        context.sites,
+        context.site_mask,
+        context.options.arch.width,
+        context.options.arch.height,
+        rng,
+    );
+    Ok((focus, targets))
+}
+
+fn accept_trial(
+    rng: &mut ChaCha8Rng,
+    current_total: f64,
+    trial_total: f64,
+    temperature: f64,
+) -> bool {
+    if trial_total + 1e-9 < current_total {
+        return true;
+    }
+    let delta = trial_total - current_total;
+    let threshold = (-delta / temperature.max(0.01)).exp().clamp(0.0, 1.0);
+    rng.random::<f64>() < threshold
+}
+
+fn update_best_solution(
+    best: &mut PlacementSolution,
+    current: &[Option<Point>],
+    current_metrics: &PlacementMetrics,
+) -> bool {
+    if current_metrics.total + 1e-9 >= best.metrics.total {
+        return false;
+    }
+    best.placements.as_mut_slice().clone_from_slice(current);
+    best.metrics = current_metrics.clone();
+    true
+}
+
+fn incremental_state<'a>(
+    context: &'a SolveContext<'a>,
+    placements: Vec<Option<Point>>,
+) -> IncrementalAnnealState<'a> {
+    let evaluator = PlacementEvaluator::new_from_positions(
+        context.model,
+        context.graph,
+        placements,
         &context.options.arch,
         context.options.delay.as_deref(),
         context.options.mode,
     );
-    let mut current_occupancy = occupancy_map(
+    let occupancy = occupancy_map(
         evaluator.placements(),
         context.options.arch.width,
         context.options.arch.height,
     );
-    let mut current_metrics = evaluator.metrics().clone();
-    let mut best = evaluator.placements().to_vec();
-    let mut best_metrics = evaluator.metrics().clone();
+    let metrics = evaluator.metrics().clone();
+    IncrementalAnnealState {
+        evaluator,
+        occupancy,
+        metrics,
+    }
+}
+
+fn full_state(context: &SolveContext<'_>, current: Vec<Option<Point>>) -> FullAnnealState {
+    let occupancy = occupancy_map(
+        &current,
+        context.options.arch.width,
+        context.options.arch.height,
+    );
+    let metrics = evaluate_positions(
+        context.model,
+        context.graph,
+        &current,
+        &context.options.arch,
+        context.options.delay.as_deref(),
+        context.options.mode,
+    );
+    let trial = current.clone();
+    FullAnnealState {
+        current,
+        trial,
+        occupancy,
+        metrics,
+    }
+}
+
+fn best_incremental_trial(
+    context: &SolveContext<'_>,
+    evaluator: &PlacementEvaluator<'_>,
+    current_occupancy: &[SiteOccupancy],
+    focus: ClusterId,
+    candidates: CandidateTargets,
+) -> Option<PlacementCandidate> {
+    let mut best_trial: Option<PlacementCandidate> = None;
+    for target in candidates {
+        let Some(changes) = plan_target_updates(
+            evaluator.placements(),
+            current_occupancy,
+            context.movable_mask,
+            focus,
+            target,
+            context.options.arch.width,
+            context.options.arch.slices_per_tile.max(1),
+        ) else {
+            continue;
+        };
+        let trial = evaluator.evaluate_candidate(&changes);
+        let metrics = trial.metrics();
+        if best_trial
+            .as_ref()
+            .is_none_or(|best_candidate| metrics.total < best_candidate.metrics().total)
+        {
+            best_trial = Some(trial);
+        }
+    }
+    best_trial
+}
+
+fn maybe_apply_incremental_swap(
+    context: &SolveContext<'_>,
+    state: &mut IncrementalAnnealState<'_>,
+    best: &mut PlacementSolution,
+    rng: &mut ChaCha8Rng,
+) {
+    if let Some(swapped) = random_swap_updates(state.evaluator.placements(), context.movable, rng) {
+        let swap_candidate = state.evaluator.evaluate_candidate(&swapped);
+        let swap_metrics = swap_candidate.metrics().clone();
+        if swap_metrics.total < state.metrics.total {
+            state.evaluator.apply_candidate(swap_candidate);
+            state.occupancy = occupancy_map(
+                state.evaluator.placements(),
+                context.options.arch.width,
+                context.options.arch.height,
+            );
+            state.metrics = swap_metrics;
+            update_best_solution(best, state.evaluator.placements(), &state.metrics);
+        }
+    }
+}
+
+fn solve_incremental(context: &SolveContext<'_>) -> Result<PlacementSolution> {
+    let mut rng = ChaCha8Rng::seed_from_u64(context.options.seed);
+    let mut state = incremental_state(context, initial_positions(context)?);
+    let mut best = PlacementSolution {
+        placements: state.evaluator.placements().to_vec(),
+        metrics: state.evaluator.metrics().clone(),
+    };
     let focus_weights = focus_weights(context);
 
-    let iterations = 700 + context.movable.len() * 50;
-    let mut temperature = (current_metrics.total / context.movable.len().max(1) as f64).max(0.5);
+    let iterations = anneal_iterations(context);
+    let mut temperature = anneal_temperature(state.metrics.total, context.movable.len());
     let mut stall = 0usize;
 
     for step in 0..iterations {
-        let focus = choose_focus(&focus_weights, &mut rng)
-            .ok_or_else(|| anyhow!("missing movable cluster during placement"))?;
-        let candidates = candidate_targets(
-            focus,
-            context.model,
-            context.graph,
-            evaluator.placements(),
-            context.sites,
-            context.site_mask,
-            context.options.arch.width,
-            context.options.arch.height,
+        let (focus, candidates) = choose_focus_and_targets(
+            context,
+            state.evaluator.placements(),
+            &focus_weights,
             &mut rng,
+        )?;
+        let best_trial = best_incremental_trial(
+            context,
+            &state.evaluator,
+            &state.occupancy,
+            focus,
+            candidates,
         );
-
-        let mut best_trial: Option<PlacementCandidate> = None;
-        for target in candidates {
-            let Some(changes) = plan_target_updates(
-                evaluator.placements(),
-                &current_occupancy,
-                context.movable_mask,
-                focus,
-                target,
-                context.options.arch.width,
-                context.options.arch.slices_per_tile.max(1),
-            ) else {
-                continue;
-            };
-            let trial = evaluator.evaluate_candidate(&changes);
-            let metrics = trial.metrics();
-            if best_trial
-                .as_ref()
-                .is_none_or(|best_candidate| metrics.total < best_candidate.metrics().total)
-            {
-                best_trial = Some(trial);
-            }
-        }
 
         let Some(trial) = best_trial else {
             continue;
         };
         let trial_metrics = trial.metrics().clone();
-        let improved = trial_metrics.total + 1e-9 < current_metrics.total;
-        let accept = if improved {
-            true
-        } else {
-            let delta = trial_metrics.total - current_metrics.total;
-            let threshold = (-delta / temperature.max(0.01)).exp().clamp(0.0, 1.0);
-            rng.random::<f64>() < threshold
-        };
+        let accept = accept_trial(
+            &mut rng,
+            state.metrics.total,
+            trial_metrics.total,
+            temperature,
+        );
 
         if accept {
-            evaluator.apply_candidate(trial);
-            current_occupancy = occupancy_map(
-                evaluator.placements(),
+            state.evaluator.apply_candidate(trial);
+            state.occupancy = occupancy_map(
+                state.evaluator.placements(),
                 context.options.arch.width,
                 context.options.arch.height,
             );
-            current_metrics = trial_metrics;
-            if current_metrics.total + 1e-9 < best_metrics.total {
-                best.as_mut_slice().clone_from_slice(evaluator.placements());
-                best_metrics = current_metrics.clone();
+            state.metrics = trial_metrics;
+            if update_best_solution(&mut best, state.evaluator.placements(), &state.metrics) {
                 stall = 0;
             } else {
                 stall += 1;
@@ -227,141 +378,134 @@ fn solve_incremental(context: &SolveContext<'_>) -> Result<PlacementSolution> {
             stall += 1;
         }
 
-        if stall > context.movable.len() * 3 {
-            if let Some(swapped) =
-                random_swap_updates(evaluator.placements(), context.movable, &mut rng)
-            {
-                let swap_candidate = evaluator.evaluate_candidate(&swapped);
-                let swap_metrics = swap_candidate.metrics().clone();
-                if swap_metrics.total < current_metrics.total {
-                    evaluator.apply_candidate(swap_candidate);
-                    current_occupancy = occupancy_map(
-                        evaluator.placements(),
-                        context.options.arch.width,
-                        context.options.arch.height,
-                    );
-                    current_metrics = swap_metrics;
-                    if current_metrics.total < best_metrics.total {
-                        best.as_mut_slice().clone_from_slice(evaluator.placements());
-                        best_metrics = current_metrics.clone();
-                    }
-                }
-            }
+        if stall > stall_limit(context) {
+            maybe_apply_incremental_swap(context, &mut state, &mut best, &mut rng);
             stall = 0;
         }
 
-        temperature *= if step % 40 == 0 { 0.985 } else { 0.9985 };
-        temperature = temperature.max(0.02);
+        temperature = cool_temperature(temperature, step);
     }
 
-    Ok(refine_solution(context, best, best_metrics))
+    Ok(refine_solution(context, best.placements, best.metrics))
+}
+
+fn best_full_trial(
+    context: &SolveContext<'_>,
+    current: &[Option<Point>],
+    trial: &mut [Option<Point>],
+    current_occupancy: &[SiteOccupancy],
+    focus: ClusterId,
+    candidates: CandidateTargets,
+) -> Option<(ClusterUpdates, PlacementMetrics)> {
+    let mut best_trial: Option<(ClusterUpdates, PlacementMetrics)> = None;
+    for target in candidates {
+        let Some(changes) = plan_target_updates(
+            current,
+            current_occupancy,
+            context.movable_mask,
+            focus,
+            target,
+            context.options.arch.width,
+            context.options.arch.slices_per_tile.max(1),
+        ) else {
+            continue;
+        };
+        let backups = apply_updates_in_place(trial, &changes);
+        let metrics = evaluate_positions(
+            context.model,
+            context.graph,
+            trial,
+            &context.options.arch,
+            context.options.delay.as_deref(),
+            context.options.mode,
+        );
+        restore_updates(trial, &backups);
+        if best_trial
+            .as_ref()
+            .is_none_or(|(_, best_metrics)| metrics.total < best_metrics.total)
+        {
+            best_trial = Some((changes, metrics));
+        }
+    }
+    best_trial
+}
+
+fn maybe_apply_full_swap(
+    context: &SolveContext<'_>,
+    state: &mut FullAnnealState,
+    best: &mut PlacementSolution,
+    rng: &mut ChaCha8Rng,
+) {
+    if let Some(swapped) = random_swap_updates(&state.current, context.movable, rng) {
+        let backups = apply_updates_in_place(&mut state.trial, &swapped);
+        let swap_metrics = evaluate_positions(
+            context.model,
+            context.graph,
+            &state.trial,
+            &context.options.arch,
+            context.options.delay.as_deref(),
+            context.options.mode,
+        );
+        restore_updates(&mut state.trial, &backups);
+        if swap_metrics.total < state.metrics.total {
+            apply_updates_in_place(&mut state.current, &swapped);
+            apply_updates_in_place(&mut state.trial, &swapped);
+            state.occupancy = occupancy_map(
+                &state.current,
+                context.options.arch.width,
+                context.options.arch.height,
+            );
+            state.metrics = swap_metrics;
+            update_best_solution(best, &state.current, &state.metrics);
+        }
+    }
 }
 
 fn solve_full(context: &SolveContext<'_>) -> Result<PlacementSolution> {
     let mut rng = ChaCha8Rng::seed_from_u64(context.options.seed);
-    let mut current = initial_placement(
-        context.design,
-        context.graph,
-        context.model,
-        context.criticality,
-        context.sites,
-        context.site_mask,
-        context.options.arch.width,
-        context.options.arch.height,
-        context.options.arch.slices_per_tile.max(1),
-    )?;
-    let mut current_occupancy = occupancy_map(
-        &current,
-        context.options.arch.width,
-        context.options.arch.height,
-    );
-    let mut trial = current.clone();
-    let mut current_metrics = evaluate_positions(
-        context.model,
-        context.graph,
-        &current,
-        &context.options.arch,
-        context.options.delay.as_deref(),
-        context.options.mode,
-    );
-    let mut best = current.clone();
-    let mut best_metrics = current_metrics.clone();
+    let mut state = full_state(context, initial_positions(context)?);
+    let mut best = PlacementSolution {
+        placements: state.current.clone(),
+        metrics: state.metrics.clone(),
+    };
     let focus_weights = focus_weights(context);
 
-    let iterations = 700 + context.movable.len() * 50;
-    let mut temperature = (current_metrics.total / context.movable.len().max(1) as f64).max(0.5);
+    let iterations = anneal_iterations(context);
+    let mut temperature = anneal_temperature(state.metrics.total, context.movable.len());
     let mut stall = 0usize;
 
     for step in 0..iterations {
-        let focus = choose_focus(&focus_weights, &mut rng)
-            .ok_or_else(|| anyhow!("missing movable cluster during placement"))?;
-        let candidates = candidate_targets(
+        let (focus, candidates) =
+            choose_focus_and_targets(context, &state.current, &focus_weights, &mut rng)?;
+        let best_trial = best_full_trial(
+            context,
+            &state.current,
+            &mut state.trial,
+            &state.occupancy,
             focus,
-            context.model,
-            context.graph,
-            &current,
-            context.sites,
-            context.site_mask,
-            context.options.arch.width,
-            context.options.arch.height,
-            &mut rng,
+            candidates,
         );
-
-        let mut best_trial: Option<(ClusterUpdates, PlacementMetrics)> = None;
-        for target in candidates {
-            let Some(changes) = plan_target_updates(
-                &current,
-                &current_occupancy,
-                context.movable_mask,
-                focus,
-                target,
-                context.options.arch.width,
-                context.options.arch.slices_per_tile.max(1),
-            ) else {
-                continue;
-            };
-            let backups = apply_updates_in_place(&mut trial, &changes);
-            let metrics = evaluate_positions(
-                context.model,
-                context.graph,
-                &trial,
-                &context.options.arch,
-                context.options.delay.as_deref(),
-                context.options.mode,
-            );
-            restore_updates(&mut trial, &backups);
-            if best_trial
-                .as_ref()
-                .is_none_or(|(_, best_metrics)| metrics.total < best_metrics.total)
-            {
-                best_trial = Some((changes, metrics));
-            }
-        }
 
         let Some((trial_updates, trial_metrics)) = best_trial else {
             continue;
         };
-        let improved = trial_metrics.total + 1e-9 < current_metrics.total;
-        let accept = if improved {
-            true
-        } else {
-            let delta = trial_metrics.total - current_metrics.total;
-            let threshold = (-delta / temperature.max(0.01)).exp().clamp(0.0, 1.0);
-            rng.random::<f64>() < threshold
-        };
+        let accept = accept_trial(
+            &mut rng,
+            state.metrics.total,
+            trial_metrics.total,
+            temperature,
+        );
 
         if accept {
-            apply_updates_in_place(&mut current, &trial_updates);
-            apply_updates_in_place(&mut trial, &trial_updates);
-            current_occupancy = occupancy_map(
-                &current,
+            apply_updates_in_place(&mut state.current, &trial_updates);
+            apply_updates_in_place(&mut state.trial, &trial_updates);
+            state.occupancy = occupancy_map(
+                &state.current,
                 context.options.arch.width,
                 context.options.arch.height,
             );
-            current_metrics = trial_metrics;
-            if current_metrics.total + 1e-9 < best_metrics.total {
-                best.clone_from(&current);
-                best_metrics = current_metrics.clone();
+            state.metrics = trial_metrics;
+            if update_best_solution(&mut best, &state.current, &state.metrics) {
                 stall = 0;
             } else {
                 stall += 1;
@@ -370,41 +514,15 @@ fn solve_full(context: &SolveContext<'_>) -> Result<PlacementSolution> {
             stall += 1;
         }
 
-        if stall > context.movable.len() * 3 {
-            if let Some(swapped) = random_swap_updates(&current, context.movable, &mut rng) {
-                let backups = apply_updates_in_place(&mut trial, &swapped);
-                let swap_metrics = evaluate_positions(
-                    context.model,
-                    context.graph,
-                    &trial,
-                    &context.options.arch,
-                    context.options.delay.as_deref(),
-                    context.options.mode,
-                );
-                restore_updates(&mut trial, &backups);
-                if swap_metrics.total < current_metrics.total {
-                    apply_updates_in_place(&mut current, &swapped);
-                    apply_updates_in_place(&mut trial, &swapped);
-                    current_occupancy = occupancy_map(
-                        &current,
-                        context.options.arch.width,
-                        context.options.arch.height,
-                    );
-                    current_metrics = swap_metrics;
-                    if current_metrics.total < best_metrics.total {
-                        best.clone_from(&current);
-                        best_metrics = current_metrics.clone();
-                    }
-                }
-            }
+        if stall > stall_limit(context) {
+            maybe_apply_full_swap(context, &mut state, &mut best, &mut rng);
             stall = 0;
         }
 
-        temperature *= if step % 40 == 0 { 0.985 } else { 0.9985 };
-        temperature = temperature.max(0.02);
+        temperature = cool_temperature(temperature, step);
     }
 
-    Ok(refine_solution(context, best, best_metrics))
+    Ok(refine_solution(context, best.placements, best.metrics))
 }
 
 fn refine_solution(

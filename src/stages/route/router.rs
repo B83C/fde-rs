@@ -14,7 +14,7 @@ use super::policy::{
 use super::{
     lookup::route_context_for_node,
     mapping::{
-        endpoint_sink_nets, endpoint_source_nets, should_route_device_net,
+        WireSet, endpoint_sink_nets, endpoint_source_nets, should_route_device_net,
         should_skip_unmapped_sink, sink_requires_all_wires,
     },
     types::{
@@ -24,7 +24,7 @@ use super::{
     wire::tile_distance,
 };
 use crate::{
-    DeviceDesign, DeviceDesignIndex,
+    DeviceCell, DeviceDesign, DeviceDesignIndex, DeviceEndpoint, DeviceNet,
     cil::Cil,
     domain::{NetOrigin, is_clock_sink_wire_name},
     resource::{
@@ -36,225 +36,355 @@ use crate::{
     },
 };
 
+struct LoadedRouteResources {
+    wires: WireInterner,
+    graphs: SiteRouteGraphs,
+    stitch_db: TileStitchDb,
+    stitched_components: StitchedComponentDb,
+}
+
+struct RoutingState {
+    pips: Vec<DeviceRoutePip>,
+    notes: Vec<String>,
+    guide_usage: GuideUsageStats,
+    occupied_route_sinks: HashMap<(usize, usize, WireId), RouteSinkOwner>,
+    occupied_route_nodes: HashMap<RouteNode, RouteNodeOwner>,
+}
+
+impl RoutingState {
+    fn new() -> Self {
+        Self {
+            pips: Vec::new(),
+            notes: Vec::new(),
+            guide_usage: GuideUsageStats::default(),
+            occupied_route_sinks: HashMap::new(),
+            occupied_route_nodes: HashMap::new(),
+        }
+    }
+}
+
+struct PreparedRouteNet<'a> {
+    net_index: usize,
+    net: &'a DeviceNet,
+    driver: &'a DeviceEndpoint,
+    driver_cell: &'a DeviceCell,
+    net_kind: RouteNetKind,
+    net_origin: NetOrigin,
+    roots: Vec<RouteNode>,
+    tree_nodes: HashSet<RouteNode>,
+    tree_starts: HashSet<RouteNode>,
+    tree_start_costs: HashMap<RouteNode, usize>,
+    used_pips: HashSet<(usize, usize, WireId, WireId)>,
+}
+
 pub fn route_device_design(
     device: &DeviceDesign,
     arch: &Arch,
     arch_path: &std::path::Path,
     cil: &Cil,
 ) -> Result<DeviceRouteImage> {
+    let mut resources = load_route_resources(arch, arch_path, cil)?;
+    let index = DeviceDesignIndex::build(device);
+    let mut state = RoutingState::new();
+    let mut context = RouteSinkContext {
+        arch,
+        cil,
+        graphs: &resources.graphs,
+        stitch_db: &resources.stitch_db,
+        stitched_components: &resources.stitched_components,
+        wires: &mut resources.wires,
+    };
+
+    for net_index in route_net_order(device, &index) {
+        route_net(&mut context, device, &index, net_index, &mut state);
+    }
+
+    state.notes.push(state.guide_usage.summary());
+    Ok(DeviceRouteImage {
+        pips: state.pips,
+        notes: state.notes,
+    })
+}
+
+fn load_route_resources(
+    arch: &Arch,
+    arch_path: &std::path::Path,
+    cil: &Cil,
+) -> Result<LoadedRouteResources> {
     let mut wires = WireInterner::default();
     let graphs = load_site_route_graphs(arch_path, cil, &mut wires)?;
     let stitch_db = load_tile_stitch_db(arch_path, &mut wires)?;
     let stitched_components = build_stitched_components(&stitch_db, arch, &wires);
-    let index = DeviceDesignIndex::build(device);
+    Ok(LoadedRouteResources {
+        wires,
+        graphs,
+        stitch_db,
+        stitched_components,
+    })
+}
 
-    let mut pips = Vec::new();
-    let mut notes = Vec::new();
-    let mut guide_usage = GuideUsageStats::default();
-    let mut occupied_route_sinks = HashMap::<(usize, usize, WireId), RouteSinkOwner>::new();
-    let mut occupied_route_nodes = HashMap::<RouteNode, RouteNodeOwner>::new();
-    let context = RouteSinkContext {
-        arch,
-        cil,
-        graphs: &graphs,
-        stitch_db: &stitch_db,
-        stitched_components: &stitched_components,
-        wires: &mut wires,
+fn route_net_order(device: &DeviceDesign, index: &DeviceDesignIndex) -> Vec<usize> {
+    let mut net_order = (0..device.nets.len()).collect::<Vec<_>>();
+    net_order.sort_by_key(|&net_index| route_net_order_key(device, index, net_index));
+    net_order
+}
+
+fn route_net(
+    context: &mut RouteSinkContext<'_>,
+    device: &DeviceDesign,
+    index: &DeviceDesignIndex,
+    net_index: usize,
+    state: &mut RoutingState,
+) {
+    let Some(mut prepared) = prepare_route_net(context, device, index, net_index, &mut state.notes)
+    else {
+        return;
     };
 
-    let mut net_order = (0..device.nets.len()).collect::<Vec<_>>();
-    net_order.sort_by_key(|&net_index| route_net_order_key(device, &index, net_index));
+    for sink in ordered_net_sinks(prepared.net, prepared.driver_cell) {
+        route_net_sink(context, device, index, &mut prepared, sink, state);
+    }
+}
 
-    for net_index in net_order {
-        let net = &device.nets[net_index];
-        if !should_route_device_net(net) {
-            continue;
-        }
-
-        let Some(driver) = net.driver.as_ref() else {
-            notes.push(format!("Net {} has no routed driver.", net.name));
-            continue;
-        };
-
-        let driver_cell = match resolve_route_endpoint(device, &index, driver) {
-            ResolvedRouteEndpoint::Cell(cell) => cell,
-            ResolvedRouteEndpoint::Port(port) => {
-                notes.push(format!(
-                    "Net {} driver {} resolves to device port {} and is not a routable cell.",
-                    net.name, driver.name, port.port_name
-                ));
-                continue;
-            }
-            ResolvedRouteEndpoint::Unknown => {
-                notes.push(format!(
-                    "Net {} driver {} is not a routable cell.",
-                    net.name, driver.name
-                ));
-                continue;
-            }
-        };
-
-        let net_kind = classify_route_net_kind(driver_cell);
-        let net_origin = net.origin_kind();
-        let source_nets = endpoint_source_nets(driver_cell, driver, context.wires);
-        if source_nets.is_empty() {
-            notes.push(format!(
-                "Net {} driver {}:{} has no route-source mapping.",
-                net.name, driver.name, driver.pin
-            ));
-            continue;
-        }
-
-        let roots = source_nets
-            .iter()
-            .copied()
-            .map(|wire| RouteNode::new(driver.x, driver.y, wire))
-            .collect::<Vec<_>>();
-        let mut tree_nodes = roots.iter().copied().collect::<HashSet<_>>();
-        let mut tree_starts = tree_nodes.clone();
-        let mut tree_start_costs = roots
-            .iter()
-            .copied()
-            .map(|node| (node, 0usize))
-            .collect::<HashMap<_, _>>();
-        let mut used_pips = HashSet::<(usize, usize, WireId, WireId)>::new();
-
-        let mut sinks = net.sinks.iter().collect::<Vec<_>>();
-        // The sibling C++ router orders sinks by timing criticality rather than
-        // prioritizing same-site loads. We do not have the same per-sink
-        // timing numbers here, so use longer/farther sinks as a deterministic
-        // proxy and let trivial same-site sinks fall later.
-        sinks.sort_by_key(|sink| {
-            (
-                std::cmp::Reverse(net.guide_tiles_for_sink(sink).len()),
-                std::cmp::Reverse(tile_distance(driver.x, driver.y, sink.x, sink.y)),
-                sink.x,
-                sink.y,
-                sink.name.as_str(),
-                sink.pin.as_str(),
-            )
-        });
-
-        for sink in sinks {
-            let sink_cell = match resolve_route_endpoint(device, &index, sink) {
-                ResolvedRouteEndpoint::Cell(cell) => cell,
-                ResolvedRouteEndpoint::Port(port) => {
-                    notes.push(format!(
-                        "Net {} sink {} resolves to device port {} and is not a routable cell.",
-                        net.name, sink.name, port.port_name
-                    ));
-                    continue;
-                }
-                ResolvedRouteEndpoint::Unknown => {
-                    notes.push(format!(
-                        "Net {} sink {} is not a routable cell.",
-                        net.name, sink.name
-                    ));
-                    continue;
-                }
-            };
-
-            let sink_nets = endpoint_sink_nets(Some(driver_cell), sink_cell, sink, context.wires);
-            if sink_nets.is_empty() {
-                if should_skip_unmapped_sink(Some(driver_cell), sink_cell, sink) {
-                    continue;
-                }
-                notes.push(format!(
-                    "Net {} sink {}:{} has no route-sink mapping.",
-                    net.name, sink.name, sink.pin
-                ));
-                continue;
-            }
-
-            let sink_wire_groups = if sink_requires_all_wires(sink_cell, sink) {
-                sink_nets
-                    .iter()
-                    .copied()
-                    .map(|wire| SmallVec::<[WireId; 1]>::from_buf([wire]))
-                    .collect::<Vec<_>>()
-            } else {
-                vec![sink_nets]
-            };
-
-            let sink_guide = net.guide_tiles_for_sink(sink);
-            let ordered_guide = OrderedGuide::new(sink_guide);
-            let guide_distances = GuideDistances::new(arch, sink_guide);
-
-            for sink_wires in sink_wire_groups {
-                let spec = SinkRouteSpec {
-                    net_index,
-                    net_origin,
-                    net_kind,
-                    strict_clock_sink: net_kind == RouteNetKind::DedicatedClock
-                        && sink_wires
-                            .iter()
-                            .all(|wire| is_clock_sink_wire_name(context.wires.resolve(*wire))),
-                    ordered_guide: &ordered_guide,
-                    guide_distances: &guide_distances,
-                    roots: &roots,
-                    tree_nodes: &tree_nodes,
-                    tree_starts: &tree_starts,
-                    tree_start_costs: &tree_start_costs,
-                    sink_x: sink.x,
-                    sink_y: sink.y,
-                    sink_wires: sink_wires.as_slice(),
-                };
-
-                let Some((path, guide_mode)) = route_sink(
-                    &context,
-                    &occupied_route_sinks,
-                    &occupied_route_nodes,
-                    &spec,
-                ) else {
-                    notes.push(format!(
-                        "Net {} could not find a Rust route from {}:{} to {}:{}.",
-                        net.name, driver.name, driver.pin, sink.name, sink.pin
-                    ));
-                    continue;
-                };
-
-                guide_usage.record(guide_mode);
-                reserve_route_sinks(&mut occupied_route_sinks, net_index, net_origin, &path.pips);
-                reserve_route_nodes(
-                    context.stitched_components,
-                    &mut occupied_route_nodes,
-                    net_index,
-                    &path.nodes,
-                );
-                if let Some((&start, rest)) = path.nodes.split_first() {
-                    let base_cost = tree_start_costs.get(&start).copied().unwrap_or(0);
-                    for (offset, node) in rest
-                        .iter()
-                        .copied()
-                        .take(rest.len().saturating_sub(1))
-                        .enumerate()
-                    {
-                        tree_start_costs
-                            .entry(node)
-                            .or_insert(base_cost + offset + 1);
-                    }
-                }
-                tree_starts.extend(
-                    path.nodes
-                        .iter()
-                        .copied()
-                        .take(path.nodes.len().saturating_sub(1)),
-                );
-                tree_nodes.extend(path.nodes.iter().copied());
-
-                for pip in path.pips {
-                    if used_pips.insert((pip.x, pip.y, pip.from, pip.to))
-                        && let Some(materialized) = context.materialize_pip(pip, &net.name)
-                    {
-                        pips.push(materialized);
-                    }
-                }
-            }
-        }
+fn prepare_route_net<'a>(
+    context: &mut RouteSinkContext<'_>,
+    device: &'a DeviceDesign,
+    index: &DeviceDesignIndex<'a>,
+    net_index: usize,
+    notes: &mut Vec<String>,
+) -> Option<PreparedRouteNet<'a>> {
+    let net = &device.nets[net_index];
+    if !should_route_device_net(net) {
+        return None;
     }
 
-    notes.push(guide_usage.summary());
-    Ok(DeviceRouteImage { pips, notes })
+    let Some(driver) = net.driver.as_ref() else {
+        notes.push(format!("Net {} has no routed driver.", net.name));
+        return None;
+    };
+
+    let driver_cell = match resolve_route_endpoint(device, index, driver) {
+        ResolvedRouteEndpoint::Cell(cell) => cell,
+        ResolvedRouteEndpoint::Port(port) => {
+            notes.push(format!(
+                "Net {} driver {} resolves to device port {} and is not a routable cell.",
+                net.name, driver.name, port.port_name
+            ));
+            return None;
+        }
+        ResolvedRouteEndpoint::Unknown => {
+            notes.push(format!(
+                "Net {} driver {} is not a routable cell.",
+                net.name, driver.name
+            ));
+            return None;
+        }
+    };
+
+    let source_nets = endpoint_source_nets(driver_cell, driver, context.wires);
+    if source_nets.is_empty() {
+        notes.push(format!(
+            "Net {} driver {}:{} has no route-source mapping.",
+            net.name, driver.name, driver.pin
+        ));
+        return None;
+    }
+
+    let roots = source_nets
+        .iter()
+        .copied()
+        .map(|wire| RouteNode::new(driver.x, driver.y, wire))
+        .collect::<Vec<_>>();
+    let tree_nodes = roots.iter().copied().collect::<HashSet<_>>();
+    let tree_starts = tree_nodes.clone();
+    let tree_start_costs = roots
+        .iter()
+        .copied()
+        .map(|node| (node, 0usize))
+        .collect::<HashMap<_, _>>();
+
+    Some(PreparedRouteNet {
+        net_index,
+        net,
+        driver,
+        driver_cell,
+        net_kind: classify_route_net_kind(driver_cell),
+        net_origin: net.origin_kind(),
+        roots,
+        tree_nodes,
+        tree_starts,
+        tree_start_costs,
+        used_pips: HashSet::new(),
+    })
+}
+
+fn ordered_net_sinks<'a>(net: &'a DeviceNet, driver_cell: &DeviceCell) -> Vec<&'a DeviceEndpoint> {
+    let mut sinks = net.sinks.iter().collect::<Vec<_>>();
+    // The sibling C++ router orders sinks by timing criticality rather than
+    // prioritizing same-site loads. We do not have the same per-sink
+    // timing numbers here, so use longer/farther sinks as a deterministic
+    // proxy and let trivial same-site sinks fall later.
+    sinks.sort_by_key(|sink| {
+        (
+            std::cmp::Reverse(net.guide_tiles_for_sink(sink).len()),
+            std::cmp::Reverse(tile_distance(driver_cell.x, driver_cell.y, sink.x, sink.y)),
+            sink.x,
+            sink.y,
+            sink.name.as_str(),
+            sink.pin.as_str(),
+        )
+    });
+    sinks
+}
+
+fn route_net_sink(
+    context: &mut RouteSinkContext<'_>,
+    device: &DeviceDesign,
+    index: &DeviceDesignIndex,
+    prepared: &mut PreparedRouteNet<'_>,
+    sink: &DeviceEndpoint,
+    state: &mut RoutingState,
+) {
+    let sink_cell = match resolve_route_endpoint(device, index, sink) {
+        ResolvedRouteEndpoint::Cell(cell) => cell,
+        ResolvedRouteEndpoint::Port(port) => {
+            state.notes.push(format!(
+                "Net {} sink {} resolves to device port {} and is not a routable cell.",
+                prepared.net.name, sink.name, port.port_name
+            ));
+            return;
+        }
+        ResolvedRouteEndpoint::Unknown => {
+            state.notes.push(format!(
+                "Net {} sink {} is not a routable cell.",
+                prepared.net.name, sink.name
+            ));
+            return;
+        }
+    };
+
+    let sink_nets = endpoint_sink_nets(Some(prepared.driver_cell), sink_cell, sink, context.wires);
+    if sink_nets.is_empty() {
+        if should_skip_unmapped_sink(Some(prepared.driver_cell), sink_cell, sink) {
+            return;
+        }
+        state.notes.push(format!(
+            "Net {} sink {}:{} has no route-sink mapping.",
+            prepared.net.name, sink.name, sink.pin
+        ));
+        return;
+    }
+
+    let sink_wire_groups = sink_wire_groups(sink_cell, sink, sink_nets);
+    let sink_guide = prepared.net.guide_tiles_for_sink(sink);
+    let ordered_guide = OrderedGuide::new(sink_guide);
+    let guide_distances = GuideDistances::new(context.arch, sink_guide);
+
+    for sink_wires in sink_wire_groups {
+        let spec = SinkRouteSpec {
+            net_index: prepared.net_index,
+            net_origin: prepared.net_origin,
+            net_kind: prepared.net_kind,
+            strict_clock_sink: prepared.net_kind == RouteNetKind::DedicatedClock
+                && sink_wires
+                    .iter()
+                    .all(|wire| is_clock_sink_wire_name(context.wires.resolve(*wire))),
+            ordered_guide: &ordered_guide,
+            guide_distances: &guide_distances,
+            roots: &prepared.roots,
+            tree_nodes: &prepared.tree_nodes,
+            tree_starts: &prepared.tree_starts,
+            tree_start_costs: &prepared.tree_start_costs,
+            sink_x: sink.x,
+            sink_y: sink.y,
+            sink_wires: sink_wires.as_slice(),
+        };
+
+        let Some((path, guide_mode)) = route_sink(
+            context,
+            &state.occupied_route_sinks,
+            &state.occupied_route_nodes,
+            &spec,
+        ) else {
+            state.notes.push(format!(
+                "Net {} could not find a Rust route from {}:{} to {}:{}.",
+                prepared.net.name, prepared.driver.name, prepared.driver.pin, sink.name, sink.pin
+            ));
+            continue;
+        };
+        commit_routed_path(context, prepared, state, guide_mode, path);
+    }
+}
+
+fn sink_wire_groups(
+    sink_cell: &DeviceCell,
+    sink: &DeviceEndpoint,
+    sink_nets: WireSet,
+) -> Vec<WireSet> {
+    if sink_requires_all_wires(sink_cell, sink) {
+        sink_nets
+            .iter()
+            .copied()
+            .map(|wire| SmallVec::<[WireId; 1]>::from_buf([wire]))
+            .collect()
+    } else {
+        vec![sink_nets]
+    }
+}
+
+fn commit_routed_path(
+    context: &RouteSinkContext<'_>,
+    prepared: &mut PreparedRouteNet<'_>,
+    state: &mut RoutingState,
+    guide_mode: GuideRouteMode,
+    path: SinkRoutePath,
+) {
+    state.guide_usage.record(guide_mode);
+    reserve_route_sinks(
+        &mut state.occupied_route_sinks,
+        prepared.net_index,
+        prepared.net_origin,
+        &path.pips,
+    );
+    reserve_route_nodes(
+        context.stitched_components,
+        &mut state.occupied_route_nodes,
+        prepared.net_index,
+        &path.nodes,
+    );
+    update_tree_state(prepared, &path.nodes);
+
+    for pip in path.pips {
+        if prepared.used_pips.insert((pip.x, pip.y, pip.from, pip.to))
+            && let Some(materialized) = context.materialize_pip(pip, &prepared.net.name)
+        {
+            state.pips.push(materialized);
+        }
+    }
+}
+
+fn update_tree_state(prepared: &mut PreparedRouteNet<'_>, path_nodes: &[RouteNode]) {
+    if let Some((&start, rest)) = path_nodes.split_first() {
+        let base_cost = prepared.tree_start_costs.get(&start).copied().unwrap_or(0);
+        for (offset, node) in rest
+            .iter()
+            .copied()
+            .take(rest.len().saturating_sub(1))
+            .enumerate()
+        {
+            prepared
+                .tree_start_costs
+                .entry(node)
+                .or_insert(base_cost + offset + 1);
+        }
+    }
+    prepared.tree_starts.extend(
+        path_nodes
+            .iter()
+            .copied()
+            .take(path_nodes.len().saturating_sub(1)),
+    );
+    prepared.tree_nodes.extend(path_nodes.iter().copied());
 }
 
 fn route_net_order_key(

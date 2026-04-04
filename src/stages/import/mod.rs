@@ -1,6 +1,6 @@
 use crate::{
     edif::load_edif,
-    io::load_design,
+    io::{DesignInputFormat, detect_input_format, load_design},
     ir::Design,
     report::{StageOutput, StageReport},
 };
@@ -13,21 +13,15 @@ pub struct ImportOptions {
 }
 
 pub fn run_path(input: &Path, options: &ImportOptions) -> Result<StageOutput<Design>> {
-    let mut design = match input
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "edf" | "edif" => load_edif(input)?,
-        "xml" | "json" => load_design(input)?,
-        "v" | "sv" => {
+    let mut design = match detect_input_format(input) {
+        Some(DesignInputFormat::Edif) => load_edif(input)?,
+        Some(DesignInputFormat::Xml | DesignInputFormat::Json) => load_design(input)?,
+        Some(DesignInputFormat::Verilog) => {
             bail!(
                 "Verilog import is intentionally unsupported in this Rust rewrite. Synthesize with Yosys first and pass the EDIF to `fde map` or `fde impl`."
             )
         }
-        _ => bail!("unsupported import format for {}", input.display()),
+        None => bail!("unsupported import format for {}", input.display()),
     };
 
     design.stage = "imported".to_string();

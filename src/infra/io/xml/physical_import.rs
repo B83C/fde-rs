@@ -1,4 +1,7 @@
-use super::{helpers::attr, lut_expr::decode_lut_function};
+use super::{
+    helpers::{attr, expand_bus_port_names, parse_point, top_module_node},
+    lut_expr::decode_lut_function,
+};
 use crate::ir::{
     Cell, Cluster, Design, Endpoint, Net, Port, PortDirection, RoutePip, RouteSegment,
     SliceBindingKind,
@@ -43,37 +46,85 @@ pub(super) fn load_fde_physical_design_xml(root: Node<'_, '_>) -> Result<Design>
         .find(|node| node.has_tag_name("contents"))
         .ok_or_else(|| anyhow!("FDE physical design is missing <contents>"))?;
 
-    let mut ports = module_node
-        .children()
-        .filter(|node| node.has_tag_name("port"))
-        .flat_map(physical_ports)
-        .collect::<Vec<_>>();
-    let port_names = ports
-        .iter()
-        .map(|port| port.name.clone())
-        .collect::<BTreeSet<_>>();
-
-    let instances = contents
-        .children()
-        .filter(|node| node.has_tag_name("instance"))
-        .map(physical_instance)
-        .collect::<Vec<_>>();
-    let instances_by_name = instances
-        .iter()
-        .map(|instance| (instance.name.as_str(), instance))
-        .collect::<BTreeMap<_, _>>();
-
+    let mut ports = module_ports(module_node);
+    let port_names = port_names(&ports);
+    let instances = physical_instances(contents);
+    let instances_by_name = instances_by_name(&instances);
     let clock_buffer_ports = clock_buffer_ports(&contents, &port_names);
     let clock_bridge_pips = clock_bridge_route_pips(&contents, &clock_buffer_ports);
     apply_port_positions(&mut ports, &instances_by_name);
+    let (clusters, mut cells, slice_states) = import_slice_clusters(&instances);
+    let mut nets = import_physical_nets(
+        &contents,
+        &port_names,
+        &instances_by_name,
+        &slice_states,
+        &ports,
+        &clock_buffer_ports,
+        &clock_bridge_pips,
+    );
 
+    inject_local_lut_ff_nets(&slice_states, &mut nets);
+    attach_cell_pins(&mut cells, &nets);
+
+    let stage = infer_physical_stage(&instances, &nets);
+    let note = physical_stage_note(&stage).to_string();
+
+    Ok(Design {
+        name: attr(&root, "name"),
+        stage,
+        metadata: crate::ir::Metadata {
+            source_format: "fde-xml".to_string(),
+            notes: vec![note],
+            ..Default::default()
+        },
+        ports,
+        cells,
+        nets,
+        clusters,
+        ..Design::default()
+    })
+}
+
+fn module_ports(module_node: Node<'_, '_>) -> Vec<Port> {
+    module_node
+        .children()
+        .filter(|node| node.has_tag_name("port"))
+        .flat_map(physical_ports)
+        .collect()
+}
+
+fn port_names(ports: &[Port]) -> BTreeSet<String> {
+    ports
+        .iter()
+        .map(|port| port.name.clone())
+        .collect::<BTreeSet<_>>()
+}
+
+fn physical_instances(contents: Node<'_, '_>) -> Vec<PhysicalInstance> {
+    contents
+        .children()
+        .filter(|node| node.has_tag_name("instance"))
+        .map(physical_instance)
+        .collect::<Vec<_>>()
+}
+
+fn instances_by_name(instances: &[PhysicalInstance]) -> BTreeMap<&str, &PhysicalInstance> {
+    instances
+        .iter()
+        .map(|instance| (instance.name.as_str(), instance))
+        .collect::<BTreeMap<_, _>>()
+}
+
+fn import_slice_clusters(
+    instances: &[PhysicalInstance],
+) -> (Vec<Cluster>, Vec<Cell>, BTreeMap<String, SliceState>) {
     let mut cells = Vec::new();
     let mut clusters = Vec::new();
     let mut slice_states = BTreeMap::<String, SliceState>::new();
     for instance in instances
         .iter()
         .filter(|instance| instance.module_ref == "slice")
-        .collect::<Vec<_>>()
     {
         let (cluster, mut cluster_cells, slice_state) = build_slice_cluster(instance);
         if !cluster.members.is_empty() {
@@ -86,98 +137,128 @@ pub(super) fn load_fde_physical_design_xml(root: Node<'_, '_>) -> Result<Design>
     clusters.sort_by(|lhs, rhs| {
         slice_instance_sort_key(&lhs.name).cmp(&slice_instance_sort_key(&rhs.name))
     });
+    (clusters, cells, slice_states)
+}
 
+fn import_physical_nets(
+    contents: &Node<'_, '_>,
+    port_names: &BTreeSet<String>,
+    instances_by_name: &BTreeMap<&str, &PhysicalInstance>,
+    slice_states: &BTreeMap<String, SliceState>,
+    ports: &[Port],
+    clock_buffer_ports: &BTreeMap<String, String>,
+    clock_bridge_pips: &BTreeMap<String, Vec<RoutePip>>,
+) -> Vec<Net> {
     let mut nets = Vec::new();
     for net in contents.children().filter(|node| node.has_tag_name("net")) {
-        let physical_name = attr(&net, "name");
-        if is_pad_connection_net(&physical_name, &port_names) {
-            continue;
+        if let Some(imported) = import_physical_net(
+            net,
+            port_names,
+            instances_by_name,
+            slice_states,
+            ports,
+            clock_buffer_ports,
+            clock_bridge_pips,
+        ) {
+            nets.push(imported);
         }
-        if is_clock_bridge_net(&physical_name, &clock_buffer_ports) {
-            continue;
-        }
+    }
+    nets
+}
 
-        let logical_name = logical_net_name(&physical_name, &port_names).to_string();
-        let mut drivers = Vec::new();
-        let mut sinks = Vec::new();
-        for port_ref in net.children().filter(|node| node.has_tag_name("portRef")) {
-            let Some(instance_name) = port_ref.attribute("instanceRef") else {
-                continue;
-            };
-            let pin = attr(&port_ref, "name");
-            for (endpoint, role) in physical_logical_endpoints(
-                instance_name,
-                &pin,
-                &instances_by_name,
-                &slice_states,
-                &ports,
-                &clock_buffer_ports,
-            ) {
-                match role {
-                    PhysicalEndpointRole::Driver => push_unique_endpoint(&mut drivers, endpoint),
-                    PhysicalEndpointRole::Sink => push_unique_endpoint(&mut sinks, endpoint),
-                }
-            }
-        }
-
-        if drivers.is_empty() && sinks.is_empty() {
-            continue;
-        }
-
-        let route_pips = net
-            .children()
-            .filter(|node| node.has_tag_name("pip"))
-            .filter_map(route_pip)
-            .collect::<Vec<_>>();
-        let route_pips = if let Some(helper_pips) = clock_bridge_pips.get(logical_name.as_str()) {
-            merge_route_pips(helper_pips, route_pips)
-        } else {
-            route_pips
-        };
-        let route = derive_segments_from_pips(&route_pips);
-
-        let mut imported = Net::new(logical_name);
-        imported.driver = drivers.into_iter().next();
-        imported.sinks = sinks;
-        imported.route_pips = route_pips;
-        imported.route = route;
-        if imported.driver.is_none() && imported.sinks.is_empty() {
-            continue;
-        }
-        nets.push(imported);
+fn import_physical_net(
+    net: Node<'_, '_>,
+    port_names: &BTreeSet<String>,
+    instances_by_name: &BTreeMap<&str, &PhysicalInstance>,
+    slice_states: &BTreeMap<String, SliceState>,
+    ports: &[Port],
+    clock_buffer_ports: &BTreeMap<String, String>,
+    clock_bridge_pips: &BTreeMap<String, Vec<RoutePip>>,
+) -> Option<Net> {
+    let physical_name = attr(&net, "name");
+    if is_pad_connection_net(&physical_name, port_names) {
+        return None;
+    }
+    if is_clock_bridge_net(&physical_name, clock_buffer_ports) {
+        return None;
     }
 
-    inject_local_lut_ff_nets(&slice_states, &mut nets);
-    attach_cell_pins(&mut cells, &nets);
+    let logical_name = logical_net_name(&physical_name, port_names).to_string();
+    let (drivers, sinks) = net_endpoints(
+        net,
+        instances_by_name,
+        slice_states,
+        ports,
+        clock_buffer_ports,
+    );
+    if drivers.is_empty() && sinks.is_empty() {
+        return None;
+    }
 
-    let stage = infer_physical_stage(&instances, &nets);
-    let note = match stage.as_str() {
+    let route_pips = net
+        .children()
+        .filter(|node| node.has_tag_name("pip"))
+        .filter_map(route_pip)
+        .collect::<Vec<_>>();
+    let route_pips = if let Some(helper_pips) = clock_bridge_pips.get(logical_name.as_str()) {
+        merge_route_pips(helper_pips, route_pips)
+    } else {
+        route_pips
+    };
+    let route = derive_segments_from_pips(&route_pips);
+
+    let mut imported = Net::new(logical_name);
+    imported.driver = drivers.into_iter().next();
+    imported.sinks = sinks;
+    imported.route_pips = route_pips;
+    imported.route = route;
+    (imported.driver.is_some() || !imported.sinks.is_empty()).then_some(imported)
+}
+
+fn net_endpoints(
+    net: Node<'_, '_>,
+    instances_by_name: &BTreeMap<&str, &PhysicalInstance>,
+    slice_states: &BTreeMap<String, SliceState>,
+    ports: &[Port],
+    clock_buffer_ports: &BTreeMap<String, String>,
+) -> (Vec<Endpoint>, Vec<Endpoint>) {
+    let mut drivers = Vec::new();
+    let mut sinks = Vec::new();
+    for port_ref in net.children().filter(|node| node.has_tag_name("portRef")) {
+        let Some(instance_name) = port_ref.attribute("instanceRef") else {
+            continue;
+        };
+        let pin = attr(&port_ref, "name");
+        for (endpoint, role) in physical_logical_endpoints(
+            instance_name,
+            &pin,
+            instances_by_name,
+            slice_states,
+            ports,
+            clock_buffer_ports,
+        ) {
+            match role {
+                PhysicalEndpointRole::Driver => push_unique_endpoint(&mut drivers, endpoint),
+                PhysicalEndpointRole::Sink => push_unique_endpoint(&mut sinks, endpoint),
+            }
+        }
+    }
+    (drivers, sinks)
+}
+
+fn physical_stage_note(stage: &str) -> &'static str {
+    match stage {
         "packed" => "Imported FDE packed XML",
         "placed" => "Imported FDE placed XML",
         _ => "Imported FDE routed XML",
-    };
-
-    Ok(Design {
-        name: attr(&root, "name"),
-        stage,
-        metadata: crate::ir::Metadata {
-            source_format: "fde-xml".to_string(),
-            notes: vec![note.to_string()],
-            ..Default::default()
-        },
-        ports,
-        cells,
-        nets,
-        clusters,
-        ..Design::default()
-    })
+    }
 }
 
 fn physical_ports(node: Node<'_, '_>) -> Vec<Port> {
     let direction = attr(&node, "direction")
         .parse()
         .unwrap_or(PortDirection::Input);
-    let names = expanded_physical_port_names(node);
+    let names = expand_bus_port_names(node);
     names
         .into_iter()
         .map(|name| {
@@ -204,47 +285,6 @@ fn physical_ports(node: Node<'_, '_>) -> Vec<Port> {
             port
         })
         .collect()
-}
-
-fn expanded_physical_port_names(node: Node<'_, '_>) -> Vec<String> {
-    let name = attr(&node, "name");
-    let Some(msb) = node
-        .attribute("msb")
-        .and_then(|value| value.parse::<usize>().ok())
-    else {
-        return vec![name];
-    };
-    let lsb = node
-        .attribute("lsb")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(msb);
-    if msb >= lsb {
-        (lsb..=msb)
-            .rev()
-            .map(|index| format!("{name}[{index}]"))
-            .collect()
-    } else {
-        (msb..=lsb)
-            .map(|index| format!("{name}[{index}]"))
-            .collect()
-    }
-}
-
-fn top_module_node<'a, 'input>(root: Node<'a, 'input>) -> Result<Node<'a, 'input>> {
-    let top_module_ref = root
-        .children()
-        .find(|node| node.has_tag_name("topModule"))
-        .ok_or_else(|| anyhow!("missing <topModule> section"))?;
-    let library_name = attr(&top_module_ref, "libraryRef");
-    let module_name = attr(&top_module_ref, "name");
-    root.children()
-        .find(|node| node.has_tag_name("library") && attr(node, "name") == library_name)
-        .and_then(|library| {
-            library
-                .children()
-                .find(|node| node.has_tag_name("module") && attr(node, "name") == module_name)
-        })
-        .ok_or_else(|| anyhow!("FDE top module {module_name} not found"))
 }
 
 fn physical_instance(node: Node<'_, '_>) -> PhysicalInstance {
@@ -769,17 +809,6 @@ fn pip_position(pip: Node<'_, '_>) -> Option<(usize, usize)> {
     Some((x, y))
 }
 
-fn parse_point(value: &str) -> Option<(usize, usize, usize)> {
-    let mut parts = value.split(',').map(str::trim);
-    let x = parts.next()?.parse().ok()?;
-    let y = parts.next()?.parse().ok()?;
-    let z = parts.next().unwrap_or("0").parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((x, y, z))
-}
-
 fn push_unique_endpoint(endpoints: &mut Vec<Endpoint>, endpoint: Endpoint) {
     if endpoints
         .iter()
@@ -791,300 +820,4 @@ fn push_unique_endpoint(endpoints: &mut Vec<Endpoint>, endpoint: Endpoint) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::load_fde_physical_design_xml;
-    use crate::ir::{RoutePip, RouteSegment};
-
-    #[test]
-    fn physical_import_merges_clock_bridge_pips_back_into_clock_net() {
-        let xml = r##"
-<design name="clock_import">
-  <external name="template_work_lib">
-    <module name="slice" type="SLICE">
-      <port name="CLK" direction="input" capacitance="0.00000"/>
-    </module>
-    <module name="gclk" type="GCLK">
-      <port name="IN" direction="input" capacitance="0.00000"/>
-      <port name="OUT" direction="output" capacitance="0.00000"/>
-    </module>
-    <module name="gclkiob" type="GCLKIOB">
-      <port name="GCLKOUT" direction="output" capacitance="0.00000"/>
-      <port name="PAD" direction="inout" capacitance="0.00000"/>
-    </module>
-  </external>
-  <library name="work_lib">
-    <module name="clock_import" type="GENERIC">
-      <port name="clk" direction="input" capacitance="0.00000"/>
-      <contents>
-        <instance name="iSlice__0__" moduleRef="slice" libraryRef="template_work_lib">
-          <property name="position" type="point" value="18,36,0"/>
-          <config name="CKINV" value="1"/>
-          <config name="DXMUX" value="1"/>
-          <config name="FFX" value="#FF"/>
-        </instance>
-        <instance name="iGclk_buf__0__" moduleRef="gclk" libraryRef="template_work_lib">
-          <property name="position" type="point" value="34,27,1"/>
-        </instance>
-        <instance name="clk" moduleRef="gclkiob" libraryRef="template_work_lib">
-          <property name="position" type="point" value="34,27,1"/>
-        </instance>
-        <net name="net_IBuf-clkpad-clk" type="clock">
-          <portRef name="OUT" instanceRef="iGclk_buf__0__"/>
-          <portRef name="CLK" instanceRef="iSlice__0__"/>
-          <pip from="CLKB_GCLK1_PW" to="CLKB_GCLK1" position="34,27" dir="-&gt;"/>
-        </net>
-        <net name="net_Buf-pad-clk" type="clock">
-          <portRef name="GCLKOUT" instanceRef="clk"/>
-          <portRef name="IN" instanceRef="iGclk_buf__0__"/>
-          <pip from="CLKB_CLKPAD1" to="CLKB_GCLKBUF1_IN" position="34,27" dir="-&gt;"/>
-        </net>
-      </contents>
-    </module>
-  </library>
-  <topModule libraryRef="work_lib" name="clock_import"/>
-</design>
-"##;
-
-        let document = roxmltree::Document::parse(xml).expect("physical XML should parse");
-        let design = load_fde_physical_design_xml(document.root_element())
-            .expect("physical import should succeed");
-        let clock_net = design
-            .nets
-            .iter()
-            .find(|net| net.name == "clk")
-            .expect("clock net should be imported");
-
-        assert_eq!(
-            clock_net.route_pips,
-            vec![
-                RoutePip::new((34, 27), "CLKB_CLKPAD1", "CLKB_GCLKBUF1_IN"),
-                RoutePip::new((34, 27), "CLKB_GCLK1_PW", "CLKB_GCLK1"),
-            ]
-        );
-        assert_eq!(clock_net.route, vec![RouteSegment::new((34, 27), (34, 27))]);
-    }
-
-    #[test]
-    fn physical_import_preserves_port_pin_and_site_slot() {
-        let xml = r##"
-<design name="port_import">
-  <external name="template_work_lib">
-    <module name="iob" type="IOB">
-      <port name="OUT" direction="input" capacitance="0.00000"/>
-      <port name="PAD" direction="inout" capacitance="0.00000"/>
-    </module>
-    <module name="gclk" type="GCLK">
-      <port name="IN" direction="input" capacitance="0.00000"/>
-      <port name="OUT" direction="output" capacitance="0.00000"/>
-    </module>
-    <module name="gclkiob" type="GCLKIOB">
-      <port name="GCLKOUT" direction="output" capacitance="0.00000"/>
-      <port name="PAD" direction="inout" capacitance="0.00000"/>
-    </module>
-  </external>
-  <library name="work_lib">
-    <module name="port_import" type="GENERIC">
-      <port name="led" direction="output" capacitance="0.00000">
-        <property name="fde_pin" value="P7"/>
-        <property name="fde_position" type="point" value="5,1"/>
-      </port>
-      <port name="clk" direction="input" capacitance="0.00000">
-        <property name="fde_pin" value="P77"/>
-        <property name="fde_position" type="point" value="34,27"/>
-      </port>
-      <contents>
-        <instance name="led" moduleRef="iob" libraryRef="template_work_lib">
-          <property name="position" type="point" value="5,1,2"/>
-        </instance>
-        <instance name="iGclk_buf__0__" moduleRef="gclk" libraryRef="template_work_lib">
-          <property name="position" type="point" value="34,27,1"/>
-        </instance>
-        <instance name="clk" moduleRef="gclkiob" libraryRef="template_work_lib">
-          <property name="position" type="point" value="34,27,1"/>
-        </instance>
-        <net name="net_Buf-pad-led">
-          <portRef name="OUT" instanceRef="led"/>
-          <portRef name="led"/>
-        </net>
-        <net name="led">
-          <portRef name="PAD" instanceRef="led"/>
-        </net>
-        <net name="net_Buf-pad-clk" type="clock">
-          <portRef name="GCLKOUT" instanceRef="clk"/>
-          <portRef name="IN" instanceRef="iGclk_buf__0__"/>
-          <pip from="CLKB_CLKPAD1" to="CLKB_GCLKBUF1_IN" position="34,27" dir="-&gt;"/>
-        </net>
-        <net name="clk" type="clock">
-          <portRef name="OUT" instanceRef="iGclk_buf__0__"/>
-        </net>
-      </contents>
-    </module>
-  </library>
-  <topModule libraryRef="work_lib" name="port_import"/>
-</design>
-"##;
-
-        let document = roxmltree::Document::parse(xml).expect("physical XML should parse");
-        let design = load_fde_physical_design_xml(document.root_element())
-            .expect("physical import should succeed");
-
-        let led = design
-            .ports
-            .iter()
-            .find(|port| port.name == "led")
-            .expect("led port");
-        assert_eq!(led.pin.as_deref(), Some("P7"));
-        assert_eq!((led.x, led.y, led.z), (Some(5), Some(1), Some(2)));
-
-        let clk = design
-            .ports
-            .iter()
-            .find(|port| port.name == "clk")
-            .expect("clk port");
-        assert_eq!(clk.pin.as_deref(), Some("P77"));
-        assert_eq!((clk.x, clk.y, clk.z), (Some(34), Some(27), Some(1)));
-    }
-
-    #[test]
-    fn physical_import_expands_cpp_bus_ports_into_bit_ports() {
-        let xml = r##"
-<design name="bus_import">
-  <external name="template_work_lib">
-    <module name="iob" type="IOB">
-      <port name="OUT" direction="input" capacitance="0.00000"/>
-      <port name="PAD" direction="inout" capacitance="0.00000"/>
-    </module>
-  </external>
-  <library name="work_lib">
-    <module name="bus_import" type="GENERIC">
-      <port name="led" msb="1" lsb="0" direction="output" capacitance="0.00000"/>
-      <contents>
-        <instance name="led[1]" moduleRef="iob" libraryRef="template_work_lib">
-          <property name="position" type="point" value="5,1,3"/>
-        </instance>
-        <instance name="led[0]" moduleRef="iob" libraryRef="template_work_lib">
-          <property name="position" type="point" value="5,1,2"/>
-        </instance>
-        <net name="net_Buf-pad-led[1]">
-          <portRef name="OUT" instanceRef="led[1]"/>
-          <portRef name="led[1]"/>
-        </net>
-        <net name="led[1]">
-          <portRef name="PAD" instanceRef="led[1]"/>
-          <portRef name="led[1]"/>
-        </net>
-        <net name="net_Buf-pad-led[0]">
-          <portRef name="OUT" instanceRef="led[0]"/>
-          <portRef name="led[0]"/>
-        </net>
-        <net name="led[0]">
-          <portRef name="PAD" instanceRef="led[0]"/>
-          <portRef name="led[0]"/>
-        </net>
-      </contents>
-    </module>
-  </library>
-  <topModule libraryRef="work_lib" name="bus_import"/>
-</design>
-"##;
-
-        let document = roxmltree::Document::parse(xml).expect("physical XML should parse");
-        let design = load_fde_physical_design_xml(document.root_element())
-            .expect("physical import should succeed");
-
-        let port_names = design
-            .ports
-            .iter()
-            .map(|port| port.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(port_names, vec!["led[1]", "led[0]"]);
-
-        let led1 = design
-            .ports
-            .iter()
-            .find(|port| port.name == "led[1]")
-            .expect("led[1] port");
-        assert_eq!((led1.x, led1.y, led1.z), (Some(5), Some(1), Some(3)));
-
-        let led0 = design
-            .ports
-            .iter()
-            .find(|port| port.name == "led[0]")
-            .expect("led[0] port");
-        assert_eq!((led0.x, led0.y, led0.z), (Some(5), Some(1), Some(2)));
-
-        let net_names = design
-            .nets
-            .iter()
-            .map(|net| net.name.as_str())
-            .collect::<Vec<_>>();
-        assert!(net_names.contains(&"led[1]"));
-        assert!(net_names.contains(&"led[0]"));
-    }
-
-    #[test]
-    fn physical_import_preserves_cpp_constant_zero_lut_outputs() {
-        let xml = r##"
-<design name="const_zero_lut">
-  <external name="template_work_lib">
-    <module name="slice" type="SLICE">
-      <port name="Y" direction="output" capacitance="0.00000"/>
-    </module>
-    <module name="iob" type="IOB">
-      <port name="OUT" direction="input" capacitance="0.00000"/>
-      <port name="PAD" direction="inout" capacitance="0.00000"/>
-    </module>
-  </external>
-  <library name="work_lib">
-    <module name="const_zero_lut" type="GENERIC">
-      <port name="led" direction="output" capacitance="0.00000"/>
-      <contents>
-        <instance name="iSlice__0__" moduleRef="slice" libraryRef="template_work_lib">
-          <property name="position" type="point" value="27,23,0"/>
-          <config name="F" value="#OFF"/>
-          <config name="G" value="#LUT:D=0"/>
-          <config name="FXMUX" value="#OFF"/>
-          <config name="GYMUX" value="G"/>
-          <config name="XUSED" value="#OFF"/>
-          <config name="YUSED" value="0"/>
-        </instance>
-        <instance name="led" moduleRef="iob" libraryRef="template_work_lib">
-          <property name="position" type="point" value="34,30,1"/>
-        </instance>
-        <net name="net_Buf-pad-led">
-          <portRef name="Y" instanceRef="iSlice__0__"/>
-          <portRef name="OUT" instanceRef="led"/>
-          <pip from="S0_Y" to="OUT3" position="27,23" dir="-&gt;"/>
-        </net>
-        <net name="led">
-          <portRef name="PAD" instanceRef="led"/>
-          <portRef name="led"/>
-        </net>
-      </contents>
-    </module>
-  </library>
-  <topModule libraryRef="work_lib" name="const_zero_lut"/>
-</design>
-"##;
-
-        let document = roxmltree::Document::parse(xml).expect("physical XML should parse");
-        let design = load_fde_physical_design_xml(document.root_element())
-            .expect("physical import should succeed");
-
-        assert!(design.cells.iter().any(
-            |cell| cell.name == "iSlice__0__::lut1" && cell.property("lut_init") == Some("0x0")
-        ));
-        let led_net = design
-            .nets
-            .iter()
-            .find(|net| net.name == "led")
-            .expect("logical led net");
-        assert_eq!(
-            led_net
-                .driver
-                .as_ref()
-                .map(|endpoint| endpoint.name.as_str()),
-            Some("iSlice__0__::lut1")
-        );
-    }
-}
+mod tests;

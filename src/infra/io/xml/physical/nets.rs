@@ -9,172 +9,244 @@ use super::super::writer::{
 };
 use super::ports::split_clock_route_pips;
 
+type PortLookup<'a> = BTreeMap<&'a str, &'a PortInstanceBinding>;
+
 pub(super) fn build_physical_nets(
     design: &Design,
     index: &DesignIndex<'_>,
     cell_bindings: &BTreeMap<String, (String, SliceCellBinding)>,
     port_bindings: &[PortInstanceBinding],
 ) -> Vec<PhysicalNet> {
-    let port_lookup = port_bindings
+    let port_lookup = port_lookup(port_bindings);
+    let mut nets = build_internal_physical_nets(design, index, cell_bindings, &port_lookup);
+    nets.extend(build_port_physical_nets(design, port_bindings));
+    nets
+}
+
+fn port_lookup(port_bindings: &[PortInstanceBinding]) -> PortLookup<'_> {
+    port_bindings
         .iter()
         .map(|binding| (binding.port_name.as_str(), binding))
-        .collect::<BTreeMap<_, _>>();
-    let mut nets =
-        design
-            .nets
-            .iter()
-            .filter_map(|net| {
-                let driver_port_binding =
-                    net.driver
-                        .as_ref()
-                        .and_then(|driver| match index.resolve_endpoint(driver) {
-                            crate::ir::EndpointTarget::Port(port_id) => {
-                                let port = index.port(design, port_id);
-                                port_lookup.get(port.name.as_str()).copied()
-                            }
-                            crate::ir::EndpointTarget::Cell(_)
-                            | crate::ir::EndpointTarget::Unknown => None,
-                        });
-                let sink_port_binding =
-                    net.sinks
-                        .iter()
-                        .find_map(|sink| match index.resolve_endpoint(sink) {
-                            crate::ir::EndpointTarget::Port(port_id) => {
-                                let port = index.port(design, port_id);
-                                port_lookup.get(port.name.as_str()).copied()
-                            }
-                            crate::ir::EndpointTarget::Cell(_)
-                            | crate::ir::EndpointTarget::Unknown => None,
-                        });
-                let driver_binding =
-                    net.driver
-                        .as_ref()
-                        .and_then(|driver| match index.resolve_endpoint(driver) {
-                            crate::ir::EndpointTarget::Cell(cell_id) => {
-                                let cell = index.cell(design, cell_id);
-                                cell_bindings
-                                    .get(cell.name.as_str())
-                                    .map(|(_, binding)| *binding)
-                            }
-                            crate::ir::EndpointTarget::Port(_)
-                            | crate::ir::EndpointTarget::Unknown => None,
-                        });
-                let mut endpoints = Vec::new();
-                if let Some(driver) = &net.driver
-                    && let Some(endpoint) =
-                        physical_driver_endpoint(driver, design, cell_bindings, &port_lookup)
-                {
-                    push_unique_endpoint(&mut endpoints, endpoint);
-                }
-                for sink in &net.sinks {
-                    for endpoint in physical_sink_endpoints(
-                        sink,
-                        net.driver.as_ref(),
-                        design,
-                        cell_bindings,
-                        &port_lookup,
-                        driver_binding,
-                    ) {
-                        push_unique_endpoint(&mut endpoints, endpoint);
-                    }
-                }
-                if endpoints.len() < 2 {
-                    return None;
-                }
-                let net_name =
-                    physical_internal_net_name(net, driver_port_binding, sink_port_binding);
-                let pips = driver_port_binding
-                    .filter(|binding| binding.clock_input && binding.gclk_instance_name.is_some())
-                    .map(|binding| split_clock_route_pips(&net.route_pips, binding).0)
-                    .unwrap_or_else(|| net.route_pips.clone());
-                Some(PhysicalNet {
-                    name: net_name,
-                    net_type: driver_port_binding
-                        .is_some_and(|binding| {
-                            binding.clock_input && binding.gclk_instance_name.is_some()
-                        })
-                        .then_some("clock"),
-                    endpoints,
-                    pips,
-                })
-            })
-            .collect::<Vec<_>>();
+        .collect()
+}
 
-    for binding in port_bindings {
-        if design
-            .ports
-            .iter()
-            .find(|port| port.name == binding.port_name)
-            .is_some_and(|port| port.direction.is_input_like())
-        {
-            nets.push(PhysicalNet {
-                name: binding.port_name.clone(),
-                net_type: None,
-                endpoints: vec![
-                    PhysicalEndpoint {
-                        pin: binding.port_name.clone(),
-                        instance_ref: None,
-                    },
-                    PhysicalEndpoint {
-                        pin: "PAD".to_string(),
-                        instance_ref: Some(binding.pad_instance_name.clone()),
-                    },
-                ],
-                pips: Vec::new(),
-            });
-            if let Some(gclk_instance_name) = binding.gclk_instance_name.as_ref() {
-                nets.push(PhysicalNet {
-                    name: format!("net_Buf-pad-{}", binding.port_name),
-                    net_type: matches!(design.stage.as_str(), "routed" | "timed")
-                        .then_some("clock"),
-                    endpoints: vec![
-                        PhysicalEndpoint {
-                            pin: "GCLKOUT".to_string(),
-                            instance_ref: Some(binding.pad_instance_name.clone()),
-                        },
-                        PhysicalEndpoint {
-                            pin: "IN".to_string(),
-                            instance_ref: Some(gclk_instance_name.clone()),
-                        },
-                    ],
-                    pips: if matches!(design.stage.as_str(), "routed" | "timed") {
-                        design
-                            .nets
-                            .iter()
-                            .find(|net| net.name == binding.port_name)
-                            .map(|net| split_clock_route_pips(&net.route_pips, binding).1)
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    },
-                });
-            }
-        }
-        if design
-            .ports
-            .iter()
-            .find(|port| port.name == binding.port_name)
-            .is_some_and(|port| port.direction.is_output_like())
-        {
-            nets.push(PhysicalNet {
-                name: binding.port_name.clone(),
-                net_type: None,
-                endpoints: vec![
-                    PhysicalEndpoint {
-                        pin: "PAD".to_string(),
-                        instance_ref: Some(binding.pad_instance_name.clone()),
-                    },
-                    PhysicalEndpoint {
-                        pin: binding.port_name.clone(),
-                        instance_ref: None,
-                    },
-                ],
-                pips: Vec::new(),
-            });
-        }
+fn build_internal_physical_nets(
+    design: &Design,
+    index: &DesignIndex<'_>,
+    cell_bindings: &BTreeMap<String, (String, SliceCellBinding)>,
+    port_lookup: &PortLookup<'_>,
+) -> Vec<PhysicalNet> {
+    design
+        .nets
+        .iter()
+        .filter_map(|net| {
+            build_internal_physical_net(net, design, index, cell_bindings, port_lookup)
+        })
+        .collect()
+}
+
+fn build_internal_physical_net(
+    net: &crate::ir::Net,
+    design: &Design,
+    index: &DesignIndex<'_>,
+    cell_bindings: &BTreeMap<String, (String, SliceCellBinding)>,
+    port_lookup: &PortLookup<'_>,
+) -> Option<PhysicalNet> {
+    let driver_port_binding = net
+        .driver
+        .as_ref()
+        .and_then(|driver| resolved_port_binding(driver, design, index, port_lookup));
+    let sink_port_binding = net
+        .sinks
+        .iter()
+        .find_map(|sink| resolved_port_binding(sink, design, index, port_lookup));
+    let driver_binding = net
+        .driver
+        .as_ref()
+        .and_then(|driver| resolved_cell_binding(driver, design, index, cell_bindings));
+    let endpoints = internal_net_endpoints(net, design, cell_bindings, port_lookup, driver_binding);
+    if endpoints.len() < 2 {
+        return None;
     }
 
+    Some(PhysicalNet {
+        name: physical_internal_net_name(net, driver_port_binding, sink_port_binding),
+        net_type: is_clock_buffer_binding(driver_port_binding).then_some("clock"),
+        endpoints,
+        pips: internal_net_pips(net, driver_port_binding),
+    })
+}
+
+fn resolved_port_binding<'a>(
+    endpoint: &Endpoint,
+    design: &Design,
+    index: &DesignIndex<'_>,
+    port_lookup: &'a PortLookup<'a>,
+) -> Option<&'a PortInstanceBinding> {
+    match index.resolve_endpoint(endpoint) {
+        crate::ir::EndpointTarget::Port(port_id) => {
+            let port = index.port(design, port_id);
+            port_lookup.get(port.name.as_str()).copied()
+        }
+        crate::ir::EndpointTarget::Cell(_) | crate::ir::EndpointTarget::Unknown => None,
+    }
+}
+
+fn resolved_cell_binding(
+    endpoint: &Endpoint,
+    design: &Design,
+    index: &DesignIndex<'_>,
+    cell_bindings: &BTreeMap<String, (String, SliceCellBinding)>,
+) -> Option<SliceCellBinding> {
+    match index.resolve_endpoint(endpoint) {
+        crate::ir::EndpointTarget::Cell(cell_id) => {
+            let cell = index.cell(design, cell_id);
+            cell_bindings
+                .get(cell.name.as_str())
+                .map(|(_, binding)| *binding)
+        }
+        crate::ir::EndpointTarget::Port(_) | crate::ir::EndpointTarget::Unknown => None,
+    }
+}
+
+fn internal_net_endpoints(
+    net: &crate::ir::Net,
+    design: &Design,
+    cell_bindings: &BTreeMap<String, (String, SliceCellBinding)>,
+    port_lookup: &PortLookup<'_>,
+    driver_binding: Option<SliceCellBinding>,
+) -> Vec<PhysicalEndpoint> {
+    let mut endpoints = Vec::new();
+    if let Some(driver) = &net.driver
+        && let Some(endpoint) = physical_driver_endpoint(driver, design, cell_bindings, port_lookup)
+    {
+        push_unique_endpoint(&mut endpoints, endpoint);
+    }
+    for sink in &net.sinks {
+        for endpoint in physical_sink_endpoints(
+            sink,
+            net.driver.as_ref(),
+            design,
+            cell_bindings,
+            port_lookup,
+            driver_binding,
+        ) {
+            push_unique_endpoint(&mut endpoints, endpoint);
+        }
+    }
+    endpoints
+}
+
+fn is_clock_buffer_binding(binding: Option<&PortInstanceBinding>) -> bool {
+    binding.is_some_and(|binding| binding.clock_input && binding.gclk_instance_name.is_some())
+}
+
+fn internal_net_pips(
+    net: &crate::ir::Net,
+    driver_port_binding: Option<&PortInstanceBinding>,
+) -> Vec<crate::ir::RoutePip> {
+    driver_port_binding
+        .filter(|binding| is_clock_buffer_binding(Some(binding)))
+        .map(|binding| split_clock_route_pips(&net.route_pips, binding).0)
+        .unwrap_or_else(|| net.route_pips.clone())
+}
+
+fn build_port_physical_nets(
+    design: &Design,
+    port_bindings: &[PortInstanceBinding],
+) -> Vec<PhysicalNet> {
+    port_bindings
+        .iter()
+        .flat_map(|binding| port_physical_nets_for_binding(design, binding))
+        .collect()
+}
+
+fn port_physical_nets_for_binding(
+    design: &Design,
+    binding: &PortInstanceBinding,
+) -> Vec<PhysicalNet> {
+    let mut nets = Vec::new();
+    if binding.direction.is_input_like() {
+        nets.push(input_port_pad_net(binding));
+        if let Some(gclk_net) = input_clock_helper_net(design, binding) {
+            nets.push(gclk_net);
+        }
+    }
+    if binding.direction.is_output_like() {
+        nets.push(output_port_pad_net(binding));
+    }
     nets
+}
+
+fn input_port_pad_net(binding: &PortInstanceBinding) -> PhysicalNet {
+    PhysicalNet {
+        name: binding.port_name.clone(),
+        net_type: None,
+        endpoints: vec![
+            PhysicalEndpoint {
+                pin: binding.port_name.clone(),
+                instance_ref: None,
+            },
+            PhysicalEndpoint {
+                pin: "PAD".to_string(),
+                instance_ref: Some(binding.pad_instance_name.clone()),
+            },
+        ],
+        pips: Vec::new(),
+    }
+}
+
+fn input_clock_helper_net(design: &Design, binding: &PortInstanceBinding) -> Option<PhysicalNet> {
+    let gclk_instance_name = binding.gclk_instance_name.as_ref()?;
+    Some(PhysicalNet {
+        name: format!("net_Buf-pad-{}", binding.port_name),
+        net_type: is_routed_physical_stage(design).then_some("clock"),
+        endpoints: vec![
+            PhysicalEndpoint {
+                pin: "GCLKOUT".to_string(),
+                instance_ref: Some(binding.pad_instance_name.clone()),
+            },
+            PhysicalEndpoint {
+                pin: "IN".to_string(),
+                instance_ref: Some(gclk_instance_name.clone()),
+            },
+        ],
+        pips: helper_clock_pips(design, binding),
+    })
+}
+
+fn helper_clock_pips(design: &Design, binding: &PortInstanceBinding) -> Vec<crate::ir::RoutePip> {
+    if !is_routed_physical_stage(design) {
+        return Vec::new();
+    }
+    design
+        .nets
+        .iter()
+        .find(|net| net.name == binding.port_name)
+        .map(|net| split_clock_route_pips(&net.route_pips, binding).1)
+        .unwrap_or_default()
+}
+
+fn output_port_pad_net(binding: &PortInstanceBinding) -> PhysicalNet {
+    PhysicalNet {
+        name: binding.port_name.clone(),
+        net_type: None,
+        endpoints: vec![
+            PhysicalEndpoint {
+                pin: "PAD".to_string(),
+                instance_ref: Some(binding.pad_instance_name.clone()),
+            },
+            PhysicalEndpoint {
+                pin: binding.port_name.clone(),
+                instance_ref: None,
+            },
+        ],
+        pips: Vec::new(),
+    }
+}
+
+fn is_routed_physical_stage(design: &Design) -> bool {
+    matches!(design.stage.as_str(), "routed" | "timed")
 }
 
 fn physical_internal_net_name(
