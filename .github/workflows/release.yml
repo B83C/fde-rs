@@ -297,7 +297,7 @@ jobs:
     needs:
       - verify-release
       - publish-github-release
-    if: ${{ vars.ENABLE_CRATES_RELEASE == 'true' && secrets.CARGO_REGISTRY_TOKEN != '' }}
+    if: ${{ vars.ENABLE_CRATES_RELEASE == 'true' }}
     environment:
       name: crates-io
 
@@ -313,5 +313,18 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Validate crates.io token
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CARGO_REGISTRY_TOKEN}" ]]; then
+            echo "CARGO_REGISTRY_TOKEN is not configured" >&2
+            exit 1
+          fi
+
       - name: Publish crate
-        run: cargo publish --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked --token "${CARGO_REGISTRY_TOKEN}"
