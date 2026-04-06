@@ -3,6 +3,7 @@ use crate::{
     constraints::{
         SharedConstraints, apply_constraints, ensure_cluster_positions, ensure_port_positions,
     },
+    domain::PrimitiveKind,
     ir::{Design, RoutePip, RouteSegment},
     report::{StageOutput, StageReport},
     resource::{Arch, SharedArch},
@@ -54,6 +55,15 @@ pub fn run_with_artifacts(
     ensure_port_positions(&mut design, &options.arch);
     if !design.clusters.is_empty() {
         ensure_cluster_positions(&design)?;
+    }
+    if design
+        .cells
+        .iter()
+        .any(|cell| matches!(cell.primitive_kind(), PrimitiveKind::BlockRam))
+    {
+        bail!(
+            "Block RAM cells are imported, packed, and placed, but BRAM macro routing/bitgen is not implemented yet."
+        );
     }
 
     let Some(device_design) = options.device_design.clone() else {
@@ -174,7 +184,12 @@ fn derive_segments_from_pips(pips: &[RoutePip]) -> Vec<RouteSegment> {
 
 #[cfg(test)]
 mod tests {
-    use crate::ir::{Design, Endpoint, Net, RoutePip, RouteSegment};
+    use crate::{
+        cil::Cil,
+        domain::{CellKind, ClusterKind},
+        ir::{Cell, Cluster, Design, Endpoint, Net, RoutePip, RouteSegment},
+        resource::Arch,
+    };
 
     use super::{DeviceRouteImage, apply_route_image, derive_segments_from_pips};
 
@@ -249,5 +264,48 @@ mod tests {
                 RouteSegment::new((2, 2), (2, 3)),
             ]
         );
+    }
+
+    #[test]
+    fn route_stage_rejects_block_ram_until_macro_routing_exists() {
+        let design = Design {
+            cells: vec![
+                Cell::new("ram0", CellKind::BlockRam, "BLOCKRAM_SINGLE_PORT")
+                    .with_input("CLK", "clk")
+                    .with_output("DO0", "q")
+                    .in_cluster("bram0"),
+            ],
+            nets: vec![
+                Net::new("clk")
+                    .with_driver(Endpoint::port("clk", "IN"))
+                    .with_sink(Endpoint::cell("ram0", "CLK")),
+            ],
+            clusters: vec![
+                Cluster::new("bram0", ClusterKind::BlockRam)
+                    .with_member("ram0")
+                    .with_capacity(1)
+                    .fixed_at_slot(1, 0, 0),
+            ],
+            ..Design::default()
+        };
+
+        let err = super::run(
+            design,
+            &super::RouteOptions {
+                arch: Arch {
+                    name: "mini".to_string(),
+                    width: 4,
+                    height: 4,
+                    ..Arch::default()
+                }
+                .into(),
+                arch_path: std::path::PathBuf::new(),
+                constraints: Vec::new().into(),
+                cil: Some(Cil::default()),
+                device_design: None,
+            },
+        )
+        .expect_err("block RAM should fail before routing");
+        assert!(err.to_string().contains("Block RAM cells"));
     }
 }

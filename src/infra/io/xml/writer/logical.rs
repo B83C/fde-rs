@@ -521,6 +521,7 @@ fn module_type_name(cell: &Cell) -> String {
     match cell.kind {
         CellKind::Lut => "LUT".to_string(),
         CellKind::Ff | CellKind::Latch => "FFLATCH".to_string(),
+        CellKind::BlockRam => "BRAM".to_string(),
         CellKind::Io => "IO".to_string(),
         CellKind::GlobalClockBuffer => "GCLK".to_string(),
         CellKind::Constant => "CONST".to_string(),
@@ -531,6 +532,7 @@ fn module_type_name(cell: &Cell) -> String {
             PrimitiveKind::Io => "IO".to_string(),
             PrimitiveKind::Lut { .. } => "LUT".to_string(),
             PrimitiveKind::FlipFlop | PrimitiveKind::Latch => "FFLATCH".to_string(),
+            PrimitiveKind::BlockRam => "BRAM".to_string(),
             PrimitiveKind::Constant(_) => "CONST".to_string(),
             PrimitiveKind::Generic | PrimitiveKind::Unknown => "GENERIC".to_string(),
         },
@@ -616,6 +618,7 @@ fn logical_lut_input_count(primitive: PrimitiveKind) -> Option<usize> {
         | PrimitiveKind::Buffer
         | PrimitiveKind::Io
         | PrimitiveKind::GlobalClockBuffer
+        | PrimitiveKind::BlockRam
         | PrimitiveKind::Generic
         | PrimitiveKind::Unknown => None,
     }
@@ -633,6 +636,7 @@ fn logical_truth_table_bits(primitive: PrimitiveKind) -> Option<usize> {
         | PrimitiveKind::Buffer
         | PrimitiveKind::Io
         | PrimitiveKind::GlobalClockBuffer
+        | PrimitiveKind::BlockRam
         | PrimitiveKind::Generic
         | PrimitiveKind::Unknown => return None,
     };

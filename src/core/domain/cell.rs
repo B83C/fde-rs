@@ -20,6 +20,8 @@ pub enum CellKind {
     Io,
     #[serde(rename = "gclk")]
     GlobalClockBuffer,
+    #[serde(rename = "blockram")]
+    BlockRam,
     #[serde(rename = "generic")]
     Generic,
     #[default]
@@ -59,6 +61,11 @@ impl CellKind {
         if raw.eq_ignore_ascii_case("gclk") || raw.eq_ignore_ascii_case("global_clock_buffer") {
             return Self::GlobalClockBuffer;
         }
+        if trimmed_contains_ignore_ascii_case(raw, "blockram")
+            || trimmed_contains_ignore_ascii_case(raw, "ramb")
+        {
+            return Self::BlockRam;
+        }
         if raw.eq_ignore_ascii_case("generic") {
             return Self::Generic;
         }
@@ -74,6 +81,7 @@ impl CellKind {
             Self::Buffer => "buffer",
             Self::Io => "iob",
             Self::GlobalClockBuffer => "gclk",
+            Self::BlockRam => "blockram",
             Self::Generic => "generic",
             Self::Unknown => "unknown",
         }

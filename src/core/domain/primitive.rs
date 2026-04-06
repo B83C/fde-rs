@@ -22,6 +22,7 @@ pub enum PrimitiveKind {
     Buffer,
     Io,
     GlobalClockBuffer,
+    BlockRam,
     Generic,
     Unknown,
 }
@@ -64,6 +65,12 @@ impl PrimitiveKind {
         {
             return Self::GlobalClockBuffer;
         }
+        if matches!(kind, CellKind::BlockRam)
+            || trimmed_contains_ignore_ascii_case(type_name, "BLOCKRAM")
+            || trimmed_contains_ignore_ascii_case(type_name, "RAMB")
+        {
+            return Self::BlockRam;
+        }
         if matches!(kind, CellKind::Io) || trimmed_eq_ignore_ascii_case(type_name, "IOB") {
             return Self::Io;
         }
@@ -93,6 +100,10 @@ impl PrimitiveKind {
 
     pub fn is_buffer(self) -> bool {
         matches!(self, Self::Buffer)
+    }
+
+    pub fn is_block_ram(self) -> bool {
+        matches!(self, Self::BlockRam)
     }
 
     pub fn constant_kind(self) -> Option<ConstantKind> {
@@ -147,21 +158,31 @@ impl PrimitiveKind {
     }
 
     pub fn is_clock_pin(self, pin: &str) -> bool {
-        self.is_sequential()
+        (self.is_sequential()
             && (trimmed_eq_ignore_ascii_case(pin, "C")
                 || trimmed_eq_ignore_ascii_case(pin, "CK")
                 || trimmed_eq_ignore_ascii_case(pin, "CLK")
                 || trimmed_eq_ignore_ascii_case(pin, "CKN")
-                || trimmed_eq_ignore_ascii_case(pin, "CLKN"))
+                || trimmed_eq_ignore_ascii_case(pin, "CLKN")))
+            || (self.is_block_ram()
+                && matches!(
+                    normalized_block_ram_pin(pin).as_str(),
+                    "CKA" | "CKB" | "CLKA" | "CLKB" | "CLK"
+                ))
     }
 
     pub fn is_clock_enable_pin(self, pin: &str) -> bool {
-        self.is_sequential()
-            && (trimmed_eq_ignore_ascii_case(pin, "CE") || trimmed_eq_ignore_ascii_case(pin, "E"))
+        (self.is_sequential()
+            && (trimmed_eq_ignore_ascii_case(pin, "CE") || trimmed_eq_ignore_ascii_case(pin, "E")))
+            || (self.is_block_ram()
+                && matches!(
+                    normalized_block_ram_pin(pin).as_str(),
+                    "AEN" | "BEN" | "ENA" | "ENB" | "EN"
+                ))
     }
 
     pub fn is_set_reset_pin(self, pin: &str) -> bool {
-        self.is_sequential()
+        (self.is_sequential()
             && (trimmed_eq_ignore_ascii_case(pin, "R")
                 || trimmed_eq_ignore_ascii_case(pin, "S")
                 || trimmed_eq_ignore_ascii_case(pin, "RN")
@@ -171,11 +192,25 @@ impl PrimitiveKind {
                 || trimmed_eq_ignore_ascii_case(pin, "RESET")
                 || trimmed_eq_ignore_ascii_case(pin, "SET")
                 || trimmed_eq_ignore_ascii_case(pin, "CLR")
-                || trimmed_eq_ignore_ascii_case(pin, "CLEAR"))
+                || trimmed_eq_ignore_ascii_case(pin, "CLEAR")))
+            || (self.is_block_ram()
+                && matches!(
+                    normalized_block_ram_pin(pin).as_str(),
+                    "RSTA" | "RSTB" | "RST"
+                ))
     }
 
     pub fn is_register_data_pin(self, pin: &str) -> bool {
         self.is_sequential() && trimmed_eq_ignore_ascii_case(pin, "D")
+    }
+
+    pub fn is_block_ram_output_pin(self, pin: &str) -> bool {
+        self.is_block_ram() && {
+            let normalized = normalized_block_ram_pin(pin);
+            normalized.starts_with("DO")
+                || normalized.starts_with("DOUT")
+                || normalized.starts_with("Q")
+        }
     }
 }
 
@@ -186,6 +221,14 @@ fn parse_lut_inputs(type_name: &str) -> Option<usize> {
         .find(|(_, ch)| ch.is_ascii_digit())
         .map(|(index, _)| index)?;
     type_name.trim().get(digit_offset..)?.parse().ok()
+}
+
+fn normalized_block_ram_pin(pin: &str) -> String {
+    pin.trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect()
 }
 
 #[cfg(test)]
@@ -211,6 +254,13 @@ mod tests {
 
         let gnd = PrimitiveKind::classify("constant", "GND");
         assert_eq!(gnd.constant_kind(), Some(ConstantKind::Zero));
+
+        let bram = PrimitiveKind::classify("blockram", "RAMB4_S16");
+        assert!(bram.is_block_ram());
+        assert!(bram.is_block_ram_output_pin("DOA[3]"));
+        assert!(bram.is_clock_pin("CLKA"));
+        assert!(bram.is_clock_enable_pin("ENA"));
+        assert!(bram.is_set_reset_pin("RSTA"));
 
         let generic = PrimitiveKind::classify("generic", "mystery");
         assert_eq!(generic, PrimitiveKind::Generic);

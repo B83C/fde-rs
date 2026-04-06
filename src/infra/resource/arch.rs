@@ -18,6 +18,7 @@ pub struct Pad {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TileKind {
     Logic,
+    BlockRam,
     LeftIo,
     RightIo,
     TopIo,
@@ -39,6 +40,7 @@ impl TileKind {
             "RIGHT" => Self::RightIo,
             "TOP" => Self::TopIo,
             "BOT" => Self::BottomIo,
+            "BRAM" | "BLOCKRAM" | "BRAM16" => Self::BlockRam,
             "CLKT" => Self::ClockTop,
             "CLKB" => Self::ClockBottom,
             "CLKC" => Self::ClockCenter,
@@ -46,12 +48,17 @@ impl TileKind {
             "CLKH" => Self::ClockHorizontal,
             "CENTER" => Self::Logic,
             _ if raw.starts_with("CENTER") => Self::Logic,
+            _ if raw.starts_with("LBRAM") || raw.starts_with("RBRAM") => Self::BlockRam,
             _ => Self::Unknown,
         }
     }
 
     pub fn is_logic(self) -> bool {
         matches!(self, Self::Logic)
+    }
+
+    pub fn is_block_ram(self) -> bool {
+        matches!(self, Self::BlockRam)
     }
 
     pub fn is_clock_pad_tile(self) -> bool {
@@ -61,6 +68,7 @@ impl TileKind {
     pub fn canonical_name(self) -> Option<&'static str> {
         match self {
             Self::Logic => Some("CENTER"),
+            Self::BlockRam => None,
             Self::LeftIo => Some("LEFT"),
             Self::RightIo => Some("RIGHT"),
             Self::TopIo => Some("TOP"),
@@ -225,6 +233,22 @@ impl Arch {
         (1..self.width - 1)
             .flat_map(|x| (1..self.height - 1).map(move |y| (x, y)))
             .collect()
+    }
+
+    pub fn block_ram_sites(&self) -> Vec<(usize, usize)> {
+        if self.tiles.is_empty() {
+            return Vec::new();
+        }
+
+        let mut sites = self
+            .tiles
+            .values()
+            .filter(|tile| is_block_ram_site_type(&tile.tile_type))
+            .map(|tile| (tile.logic_x, tile.logic_y))
+            .collect::<Vec<_>>();
+        sites.sort_unstable();
+        sites.dedup();
+        sites
     }
 
     pub fn fallback_port_position(&self, index: usize, input: bool) -> (usize, usize) {
@@ -460,6 +484,12 @@ fn apply_arch_defaults(arch: &mut Arch) {
             .max()
             .unwrap_or(1);
     }
+}
+
+fn is_block_ram_site_type(tile_type: &str) -> bool {
+    let raw = tile_type.trim().to_ascii_uppercase();
+    matches!(raw.as_str(), "BRAM" | "BLOCKRAM" | "BRAM16")
+        || ((raw.starts_with("LBRAM") || raw.starts_with("RBRAM")) && raw.ends_with('D'))
 }
 
 fn parse_point(raw: &str) -> Option<(usize, usize)> {

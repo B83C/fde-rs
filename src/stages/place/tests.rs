@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     ir::{Cell, CellPin, Cluster, ClusterId, Design, Endpoint, Net, Port},
-    resource::{Arch, DelayModel},
+    resource::{Arch, DelayModel, TileInstance},
 };
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,6 +53,37 @@ fn synthetic_arch(width: usize, height: usize) -> Arch {
         wire_c: 0.03,
         ..Arch::default()
     }
+}
+
+fn bram_arch() -> Arch {
+    let mut arch = synthetic_arch(8, 8);
+    arch.tiles.insert(
+        (1, 0),
+        TileInstance {
+            name: "BRAMR4C0".to_string(),
+            tile_type: "LBRAMD".to_string(),
+            logic_x: 1,
+            logic_y: 0,
+            bit_x: 1,
+            bit_y: 0,
+            phy_x: 1,
+            phy_y: 0,
+        },
+    );
+    arch.tiles.insert(
+        (6, 7),
+        TileInstance {
+            name: "BRAMR4C3".to_string(),
+            tile_type: "RBRAMD".to_string(),
+            logic_x: 6,
+            logic_y: 7,
+            bit_x: 6,
+            bit_y: 7,
+            phy_x: 6,
+            phy_y: 7,
+        },
+    );
+    arch
 }
 
 fn synthetic_delay(width: usize, height: usize) -> DelayModel {
@@ -164,6 +195,37 @@ fn connected_pair_design() -> Design {
         clusters: vec![
             Cluster::logic("clb0").with_member("src").with_capacity(1),
             Cluster::logic("clb1").with_member("dst").with_capacity(1),
+        ],
+        ..Design::default()
+    }
+}
+
+fn block_ram_clustered_design() -> Design {
+    Design {
+        name: "place-bram".to_string(),
+        cells: vec![
+            Cell::new(
+                "ram0",
+                crate::domain::CellKind::BlockRam,
+                "BLOCKRAM_SINGLE_PORT",
+            )
+            .with_input("CLK", "clk")
+            .with_output("DO0", "q")
+            .in_cluster("bram0"),
+        ],
+        ports: vec![Port::input("clk").at(0, 0), Port::output("q").at(7, 7)],
+        nets: vec![
+            Net::new("clk")
+                .with_driver(Endpoint::port("clk", "IN"))
+                .with_sink(Endpoint::cell("ram0", "CLK")),
+            Net::new("q")
+                .with_driver(Endpoint::cell("ram0", "DO0"))
+                .with_sink(Endpoint::port("q", "OUT")),
+        ],
+        clusters: vec![
+            Cluster::new("bram0", crate::domain::ClusterKind::BlockRam)
+                .with_member("ram0")
+                .with_capacity(1),
         ],
         ..Design::default()
     }
@@ -525,6 +587,29 @@ fn incremental_evaluator_matches_full_recompute_for_move_and_swap() {
 
     evaluator.apply_candidate(swap_candidate);
     assert_metrics_close(evaluator.metrics(), &swapped_metrics);
+}
+
+#[test]
+fn placement_assigns_block_ram_clusters_to_block_ram_sites() -> Result<()> {
+    let placed = run(
+        block_ram_clustered_design(),
+        &PlaceOptions {
+            arch: bram_arch().into(),
+            delay: None,
+            constraints: Vec::new().into(),
+            mode: PlaceMode::BoundingBox,
+            seed: 1,
+        },
+    )?
+    .value;
+
+    assert_eq!(placed_sites(&placed), vec![("bram0".to_string(), 1, 0, 0)]);
+    assert!(
+        placed.clusters[0].fixed,
+        "block RAM placement should reserve a dedicated site"
+    );
+
+    Ok(())
 }
 
 #[test]

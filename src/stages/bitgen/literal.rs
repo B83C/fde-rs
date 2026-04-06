@@ -119,6 +119,7 @@ fn logical_truth_table_bits(primitive: PrimitiveKind) -> Option<usize> {
         | PrimitiveKind::Buffer
         | PrimitiveKind::Io
         | PrimitiveKind::GlobalClockBuffer
+        | PrimitiveKind::BlockRam
         | PrimitiveKind::Generic
         | PrimitiveKind::Unknown => return None,
     };

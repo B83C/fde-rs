@@ -7,13 +7,14 @@ mod support;
 use crate::{
     analysis::annotate_net_criticality,
     constraints::{apply_constraints, ensure_port_positions},
+    domain::ClusterKind,
     ir::Design,
     report::{StageOutput, StageReport},
-    resource::{SharedArch, SharedDelayModel},
+    resource::{Arch, SharedArch, SharedDelayModel},
 };
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use self::model::Point;
 
@@ -60,12 +61,18 @@ pub fn run(mut design: Design, options: &PlaceOptions) -> Result<StageOutput<Des
         });
     }
 
+    let block_ram_cluster_count = assign_block_ram_clusters(&mut design, &options.arch)?;
     let sites = options.arch.logic_sites();
     let site_capacity = options.arch.slices_per_tile.max(1);
-    if design.clusters.len() > sites.len().saturating_mul(site_capacity) {
+    let logic_cluster_count = design
+        .clusters
+        .iter()
+        .filter(|cluster| cluster.kind != ClusterKind::BlockRam)
+        .count();
+    if logic_cluster_count > sites.len().saturating_mul(site_capacity) {
         bail!(
             "not enough logic sites: need {}, only {} available",
-            design.clusters.len(),
+            logic_cluster_count,
             sites.len().saturating_mul(site_capacity)
         );
     }
@@ -84,6 +91,7 @@ pub fn run(mut design: Design, options: &PlaceOptions) -> Result<StageOutput<Des
     report.metric("grid_width", options.arch.width);
     report.metric("grid_height", options.arch.height);
     report.metric("site_capacity", site_capacity);
+    report.metric("block_ram_cluster_count", block_ram_cluster_count);
     report.metric("mode", format!("{:?}", options.mode));
     report.metric("final_cost", solution.metrics.total);
     report.metric("wire_cost", solution.metrics.wire_cost);
@@ -109,6 +117,64 @@ pub fn run(mut design: Design, options: &PlaceOptions) -> Result<StageOutput<Des
         value: design,
         report,
     })
+}
+
+fn assign_block_ram_clusters(design: &mut Design, arch: &Arch) -> Result<usize> {
+    let block_ram_sites = arch.block_ram_sites();
+    let available = block_ram_sites.iter().copied().collect::<BTreeSet<_>>();
+    let mut used = BTreeSet::<(usize, usize)>::new();
+    let mut block_ram_clusters = design
+        .clusters
+        .iter_mut()
+        .filter(|cluster| cluster.kind == ClusterKind::BlockRam)
+        .collect::<Vec<_>>();
+    if block_ram_clusters.is_empty() {
+        return Ok(0);
+    }
+    if available.is_empty() {
+        bail!("design contains block RAM clusters, but architecture exposes no block RAM sites");
+    }
+
+    for cluster in &mut block_ram_clusters {
+        if let Some((x, y)) = cluster.x.zip(cluster.y) {
+            if !available.contains(&(x, y)) {
+                bail!(
+                    "block RAM cluster {} is assigned to non-BRAM site ({x}, {y})",
+                    cluster.name
+                );
+            }
+            if !used.insert((x, y)) {
+                bail!("multiple block RAM clusters request site ({x}, {y})");
+            }
+            cluster.z = Some(0);
+            cluster.fixed = true;
+        }
+    }
+
+    let mut remaining_sites = block_ram_sites
+        .into_iter()
+        .filter(|site| !used.contains(site))
+        .collect::<Vec<_>>();
+    remaining_sites.sort_unstable();
+    let mut next_site = remaining_sites.into_iter();
+    for cluster in &mut block_ram_clusters {
+        if cluster.x.is_some() && cluster.y.is_some() {
+            continue;
+        }
+        let Some((x, y)) = next_site.next() else {
+            bail!(
+                "not enough block RAM sites: need {}, only {} available",
+                block_ram_clusters.len(),
+                available.len()
+            );
+        };
+        cluster.x = Some(x);
+        cluster.y = Some(y);
+        cluster.z = Some(0);
+        cluster.fixed = true;
+    }
+
+    Ok(block_ram_clusters.len())
 }
 
 fn assign_cluster_slots(design: &mut Design, site_capacity: usize) -> Result<()> {

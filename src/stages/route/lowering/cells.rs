@@ -1,7 +1,7 @@
 use super::{DeviceCell, DeviceLowering};
 use crate::{
     cil::Cil,
-    domain::SiteKind,
+    domain::{ClusterKind, SiteKind},
     ir::{
         AssignedClusterCellKind, CellId, ClusterId, Design, DesignIndex, assign_cluster_slice_cells,
     },
@@ -45,19 +45,46 @@ fn lower_original_cells(
         let tile_type = tile
             .map(|tile| tile.tile_type.clone())
             .unwrap_or_else(|| "CENTER".to_string());
-        let slice_site_name = cil
-            .and_then(|cil| cil.site_name_for_kind(&tile_type, SiteKind::LogicSlice, z))
-            .unwrap_or("SLICE")
-            .to_string();
-        for (cell_id, bel) in assign_cluster_bels(design, index, cluster_id) {
+        let (site_kind, site_name, bels) = match cluster.kind {
+            ClusterKind::Logic => (
+                SiteKind::LogicSlice,
+                cil.and_then(|cil| cil.site_name_for_kind(&tile_type, SiteKind::LogicSlice, z))
+                    .unwrap_or("SLICE")
+                    .to_string(),
+                assign_cluster_bels(design, index, cluster_id),
+            ),
+            ClusterKind::BlockRam => (
+                SiteKind::BlockRam,
+                cil.and_then(|cil| cil.site_name_for_kind(&tile_type, SiteKind::BlockRam, z))
+                    .unwrap_or("BRAM")
+                    .to_string(),
+                index
+                    .cluster_members(cluster_id)
+                    .iter()
+                    .copied()
+                    .map(|cell_id| (cell_id, "BRAM".to_string()))
+                    .collect::<Vec<_>>(),
+            ),
+            ClusterKind::Unknown => (
+                SiteKind::Unplaced,
+                String::new(),
+                index
+                    .cluster_members(cluster_id)
+                    .iter()
+                    .copied()
+                    .map(|cell_id| (cell_id, "BEL".to_string()))
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        for (cell_id, bel) in bels {
             let cell = index.cell(design, cell_id);
             lowered.push((
                 cell_id,
                 DeviceCell::new(cell.name.clone(), cell.kind, cell.type_name.clone())
                     .with_properties(cell.properties.clone())
                     .placed(
-                        SiteKind::LogicSlice,
-                        slice_site_name.clone(),
+                        site_kind,
+                        site_name.clone(),
                         bel,
                         tile_name.clone(),
                         tile_type.clone(),

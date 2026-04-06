@@ -114,7 +114,8 @@ pub(super) fn neighbors(
 pub(super) fn classify_route_net_kind(driver_cell: &DeviceCell) -> RouteNetKind {
     match driver_cell.site_kind_class() {
         SiteKind::Gclk => RouteNetKind::DedicatedClock,
-        SiteKind::LogicSlice
+        SiteKind::BlockRam
+        | SiteKind::LogicSlice
         | SiteKind::Iob
         | SiteKind::GclkIob
         | SiteKind::Const

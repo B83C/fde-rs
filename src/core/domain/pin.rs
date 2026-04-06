@@ -40,6 +40,9 @@ impl PinRole {
         if primitive.is_register_data_pin(pin) {
             return Self::RegisterData;
         }
+        if primitive.is_block_ram_output_pin(pin) {
+            return Self::GeneralOutput;
+        }
         Self::Unknown
     }
 
@@ -52,9 +55,11 @@ impl PinRole {
             }
             SiteKind::Gclk if trimmed_eq_ignore_ascii_case(pin, "IN") => Self::GlobalClockInput,
             SiteKind::Gclk if trimmed_eq_ignore_ascii_case(pin, "OUT") => Self::GlobalClockOutput,
-            SiteKind::LogicSlice | SiteKind::Const | SiteKind::Unplaced | SiteKind::Unknown => {
-                Self::Unknown
-            }
+            SiteKind::LogicSlice
+            | SiteKind::BlockRam
+            | SiteKind::Const
+            | SiteKind::Unplaced
+            | SiteKind::Unknown => Self::Unknown,
             SiteKind::Iob | SiteKind::GclkIob | SiteKind::Gclk => Self::Unknown,
         }
     }
@@ -65,6 +70,9 @@ impl PinRole {
             return role;
         }
         if primitive.is_constant_source() {
+            return Self::GeneralOutput;
+        }
+        if primitive.is_block_ram_output_pin(pin) {
             return Self::GeneralOutput;
         }
         if trimmed_eq_ignore_ascii_case(pin, "Q")

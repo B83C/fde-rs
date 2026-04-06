@@ -1,5 +1,6 @@
 use super::DEFAULT_PACK_CAPACITY;
 use crate::{
+    domain::ClusterKind,
     ir::{CellId, Cluster, Design, DesignIndex},
     report::{StageOutput, StageReport},
 };
@@ -65,6 +66,13 @@ struct LaneUsage {
     ffs: usize,
 }
 
+#[derive(Debug, Clone)]
+struct ClusterPlan {
+    kind: ClusterKind,
+    members: Vec<CellId>,
+    capacity: usize,
+}
+
 pub fn run(mut design: Design, options: &PackOptions) -> Result<StageOutput<Design>> {
     let capacity = options.capacity.max(2);
     design.stage = "packed".to_string();
@@ -87,19 +95,19 @@ pub fn run(mut design: Design, options: &PackOptions) -> Result<StageOutput<Desi
         design.note_once(format!("Pack referenced config {}", config.display()));
     }
 
-    let cluster_members = build_cluster_members(&design, capacity);
-    let clusters = cluster_members
+    let cluster_plans = build_cluster_plans(&design, capacity);
+    let clusters = cluster_plans
         .iter()
         .enumerate()
-        .map(|(cluster_index, members)| {
-            Cluster::logic(next_cluster_name(cluster_index))
-                .with_members(cell_names(&design, members))
-                .with_capacity(capacity)
+        .map(|(cluster_index, plan)| {
+            Cluster::new(next_cluster_name(plan.kind, cluster_index), plan.kind)
+                .with_members(cell_names(&design, &plan.members))
+                .with_capacity(plan.capacity)
         })
         .collect::<Vec<_>>();
 
-    for (cluster_index, members) in cluster_members.iter().enumerate() {
-        for cell_id in members {
+    for (cluster_index, plan) in cluster_plans.iter().enumerate() {
+        for cell_id in &plan.members {
             design.cells[cell_id.index()].cluster = Some(clusters[cluster_index].name.clone());
         }
     }
@@ -130,8 +138,19 @@ pub fn run(mut design: Design, options: &PackOptions) -> Result<StageOutput<Desi
     })
 }
 
-fn build_cluster_members(design: &Design, capacity: usize) -> Vec<Vec<CellId>> {
+fn build_cluster_plans(design: &Design, capacity: usize) -> Vec<ClusterPlan> {
     let index = design.index();
+    let ordered_cells = ordered_cell_ids(design);
+    let mut plans = ordered_cells
+        .iter()
+        .copied()
+        .filter(|cell_id| index.cell(design, *cell_id).is_block_ram())
+        .map(|cell_id| ClusterPlan {
+            kind: ClusterKind::BlockRam,
+            members: vec![cell_id],
+            capacity: 1,
+        })
+        .collect::<Vec<_>>();
     let lanes = build_lanes(design, &index);
     let topology = build_lane_topology(design, &index, &lanes);
     let mut seed_lanes = (0..lanes.len()).collect::<Vec<_>>();
@@ -177,7 +196,12 @@ fn build_cluster_members(design: &Design, capacity: usize) -> Vec<Vec<CellId>> {
         clusters.push(flatten_cluster_lanes(&lanes, &cluster_lane_ids));
     }
 
-    clusters
+    plans.extend(clusters.into_iter().map(|members| ClusterPlan {
+        kind: ClusterKind::Logic,
+        members,
+        capacity,
+    }));
+    plans
 }
 
 fn build_lanes(design: &Design, index: &DesignIndex<'_>) -> Vec<Lane> {
@@ -203,7 +227,7 @@ fn build_lanes(design: &Design, index: &DesignIndex<'_>) -> Vec<Lane> {
 
     for cell_id in ordered_cells {
         let cell = index.cell(design, cell_id);
-        if used[cell_id.index()] || cell.is_constant_source() {
+        if used[cell_id.index()] || cell.is_constant_source() || cell.is_block_ram() {
             continue;
         }
         used[cell_id.index()] = true;
@@ -249,7 +273,9 @@ fn build_lane_topology(design: &Design, index: &DesignIndex<'_>, lanes: &[Lane])
             && let Some(cell_id) = index.cell_for_endpoint(driver)
             && !index.cell(design, cell_id).is_constant_source()
         {
-            let lane = cell_to_lane[cell_id.index()].expect("lane for driver");
+            let Some(lane) = cell_to_lane[cell_id.index()] else {
+                continue;
+            };
             touched_lanes.insert(lane);
             driver_lane = Some(lane);
             touched_pins += 1;
@@ -258,7 +284,10 @@ fn build_lane_topology(design: &Design, index: &DesignIndex<'_>, lanes: &[Lane])
             let Some(cell_id) = index.cell_for_endpoint(sink) else {
                 continue;
             };
-            touched_lanes.insert(cell_to_lane[cell_id.index()].expect("lane for sink"));
+            let Some(lane) = cell_to_lane[cell_id.index()] else {
+                continue;
+            };
+            touched_lanes.insert(lane);
             touched_pins += 1;
         }
         let touched = touched_lanes.into_iter().collect::<Vec<_>>();
@@ -277,7 +306,9 @@ fn build_lane_topology(design: &Design, index: &DesignIndex<'_>, lanes: &[Lane])
                 let Some(cell_id) = index.cell_for_endpoint(sink) else {
                     continue;
                 };
-                let sink_lane = cell_to_lane[cell_id.index()].expect("lane for sink");
+                let Some(sink_lane) = cell_to_lane[cell_id.index()] else {
+                    continue;
+                };
                 if sink_lane == driver_lane {
                     continue;
                 }
@@ -484,17 +515,21 @@ fn ordered_cell_ids(design: &Design) -> Vec<CellId> {
 }
 
 fn pack_class_rank(cell: &crate::ir::Cell) -> u8 {
-    if cell.is_sequential() {
+    if cell.is_block_ram() {
         0
-    } else if cell.is_lut() {
+    } else if cell.is_sequential() {
         1
-    } else {
+    } else if cell.is_lut() {
         2
+    } else {
+        3
     }
 }
 
 fn pack_rule_rank(cell: &crate::ir::Cell) -> u16 {
-    if cell.is_lut() {
+    if cell.is_block_ram() {
+        0
+    } else if cell.is_lut() {
         lut_rule_rank(&cell.type_name)
     } else if cell.is_sequential() {
         ff_rule_rank(&cell.type_name)
@@ -521,8 +556,12 @@ fn ff_rule_rank(type_name: &str) -> u16 {
     }
 }
 
-fn next_cluster_name(index: usize) -> String {
-    format!("clb_{index:04}")
+fn next_cluster_name(kind: ClusterKind, index: usize) -> String {
+    match kind {
+        ClusterKind::Logic => format!("clb_{index:04}"),
+        ClusterKind::BlockRam => format!("bram_{index:04}"),
+        ClusterKind::Unknown => format!("cluster_{index:04}"),
+    }
 }
 
 fn cell_names(design: &Design, members: &[CellId]) -> Vec<String> {

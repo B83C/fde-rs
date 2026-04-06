@@ -54,6 +54,7 @@ fn derive_site_program(
         SiteKind::LogicSlice => {
             SiteProgramKind::LogicSlice(derive_slice_program(site, device, index))
         }
+        SiteKind::BlockRam => return None,
         SiteKind::Iob => SiteProgramKind::Iob(derive_iob_program(site, device, index)),
         SiteKind::Gclk => SiteProgramKind::Gclk,
         SiteKind::GclkIob => SiteProgramKind::GclkIob,

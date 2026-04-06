@@ -61,13 +61,19 @@ pub(super) fn initial_placement(
             .y
             .ok_or_else(|| anyhow!("fixed cluster {} is missing y", cluster.name))?;
         let point = Point::new(x, y);
-        if !site_contains(site_mask, point, width, height) {
+        if cluster.kind != crate::domain::ClusterKind::BlockRam
+            && !site_contains(site_mask, point, width, height)
+        {
             bail!(
                 "fixed cluster {} is assigned to non-logic site ({}, {})",
                 cluster.name,
                 x,
                 y
             );
+        }
+        if cluster.kind == crate::domain::ClusterKind::BlockRam {
+            placements[index] = Some(point);
+            continue;
         }
         let site_index = grid_index(point, width);
         if occupied

@@ -8,6 +8,8 @@ use std::{fmt, str::FromStr};
 pub enum SiteKind {
     #[serde(rename = "SLICE")]
     LogicSlice,
+    #[serde(rename = "BRAM")]
+    BlockRam,
     #[serde(rename = "IOB")]
     Iob,
     #[serde(rename = "GCLKIOB")]
@@ -27,6 +29,11 @@ impl SiteKind {
     pub fn classify(raw: &str) -> Self {
         if trimmed_eq_ignore_ascii_case(raw, "SLICE") {
             Self::LogicSlice
+        } else if trimmed_eq_ignore_ascii_case(raw, "BRAM")
+            || trimmed_eq_ignore_ascii_case(raw, "BLOCKRAM")
+            || trimmed_eq_ignore_ascii_case(raw, "BRAM16")
+        {
+            Self::BlockRam
         } else if trimmed_eq_ignore_ascii_case(raw, "IOB") {
             Self::Iob
         } else if trimmed_eq_ignore_ascii_case(raw, "GCLKIOB") {
@@ -49,6 +56,7 @@ impl SiteKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LogicSlice => "SLICE",
+            Self::BlockRam => "BRAM",
             Self::Iob => "IOB",
             Self::GclkIob => "GCLKIOB",
             Self::Gclk => "GCLK",
@@ -92,6 +100,7 @@ mod tests {
     #[test]
     fn classifies_known_site_kinds() {
         assert_eq!(SiteKind::classify("slice"), SiteKind::LogicSlice);
+        assert_eq!(SiteKind::classify("blockram"), SiteKind::BlockRam);
         assert_eq!(SiteKind::classify("IOB"), SiteKind::Iob);
         assert_eq!(SiteKind::classify("gclkiob"), SiteKind::GclkIob);
         assert_eq!(SiteKind::classify("nope"), SiteKind::Unknown);

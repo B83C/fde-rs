@@ -1,3 +1,4 @@
+mod bram;
 mod clock;
 mod io;
 mod shared;
@@ -11,6 +12,7 @@ use crate::{
 };
 
 use self::{
+    bram::{bram_sink_nets, bram_source_nets},
     clock::{gclk_sink_nets, gclk_source_nets, gclkiob_source_nets},
     io::{iob_sink_nets, iob_source_nets},
     slice::{slice_sink_nets, slice_source_nets},
@@ -35,6 +37,7 @@ pub(crate) fn endpoint_source_nets(
 ) -> WireSet {
     match cell.site_kind_class() {
         SiteKind::LogicSlice => slice_source_nets(cell, endpoint, wires),
+        SiteKind::BlockRam => bram_source_nets(cell, endpoint, wires),
         SiteKind::Iob => iob_source_nets(cell, endpoint, wires),
         SiteKind::GclkIob => gclkiob_source_nets(cell, endpoint, wires),
         SiteKind::Gclk => gclk_source_nets(cell, endpoint, wires),
@@ -50,6 +53,7 @@ pub(crate) fn endpoint_sink_nets(
 ) -> WireSet {
     match cell.site_kind_class() {
         SiteKind::LogicSlice => slice_sink_nets(driver_cell, cell, endpoint, wires),
+        SiteKind::BlockRam => bram_sink_nets(cell, endpoint, wires),
         SiteKind::Iob => iob_sink_nets(cell, endpoint, wires),
         SiteKind::Gclk => gclk_sink_nets(cell, endpoint, wires),
         SiteKind::GclkIob | SiteKind::Const | SiteKind::Unplaced | SiteKind::Unknown => {

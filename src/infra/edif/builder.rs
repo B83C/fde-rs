@@ -196,6 +196,7 @@ fn classify_cell_kind(type_name: &str) -> CellKind {
         PrimitiveKind::Buffer => CellKind::Buffer,
         PrimitiveKind::Io => CellKind::Io,
         PrimitiveKind::GlobalClockBuffer => CellKind::GlobalClockBuffer,
+        PrimitiveKind::BlockRam => CellKind::BlockRam,
         PrimitiveKind::Generic | PrimitiveKind::Unknown => CellKind::Generic,
     }
 }

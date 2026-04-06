@@ -194,6 +194,42 @@ fn pack_scales_across_multiple_independent_lut_ff_pairs() -> Result<()> {
 }
 
 #[test]
+fn pack_assigns_block_ram_cells_to_dedicated_singleton_clusters() -> Result<()> {
+    let design = Design {
+        name: "pack-bram".to_string(),
+        cells: vec![
+            Cell::new(
+                "ram0",
+                crate::domain::CellKind::BlockRam,
+                "BLOCKRAM_SINGLE_PORT",
+            )
+            .with_input("CLK", "clk")
+            .with_output("DO0", "q"),
+            Cell::lut("lut0", "LUT4").with_input("A", "q"),
+        ],
+        nets: vec![
+            Net::new("clk").with_driver(Endpoint::port("clk", "IN")),
+            Net::new("q")
+                .with_driver(Endpoint::cell("ram0", "DO0"))
+                .with_sink(Endpoint::cell("lut0", "A")),
+        ],
+        ..Design::default()
+    };
+
+    let packed = run(design, &PackOptions::default())?.value;
+    let bram_cluster = packed
+        .clusters
+        .iter()
+        .find(|cluster| cluster.members.iter().any(|member| member == "ram0"))
+        .expect("bram cluster");
+    assert_eq!(bram_cluster.kind, crate::domain::ClusterKind::BlockRam);
+    assert_eq!(bram_cluster.capacity, 1);
+    assert_eq!(bram_cluster.members, vec!["ram0".to_string()]);
+
+    Ok(())
+}
+
+#[test]
 fn pack_can_fill_four_slot_cluster_along_connected_chain() -> Result<()> {
     let design = Design {
         name: "pack-chain".to_string(),

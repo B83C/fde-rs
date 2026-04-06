@@ -81,6 +81,54 @@ fn resolves_renamed_external_library_cells_before_classifying_instances() {
 }
 
 #[test]
+fn classifies_block_ram_instances_and_preserves_output_drivers() {
+    let design = parse_source(
+        r#"
+            (edif top
+              (library DESIGN
+                (cell top
+                  (view NETLIST
+                    (interface
+                      (port clk (direction INPUT))
+                      (port q (direction OUTPUT)))
+                    (contents
+                      (instance mem0
+                        (viewRef NETLIST (cellRef BLOCKRAM_SINGLE_PORT (libraryRef LIB))))
+                      (net clk_net
+                        (joined
+                          (portRef clk)
+                          (portRef CLK (instanceRef mem0))))
+                      (net q_net
+                        (joined
+                          (portRef DO0 (instanceRef mem0))
+                          (portRef q))))))))
+            "#,
+    )
+    .expect("parse block ram");
+
+    let cell = design
+        .cells
+        .iter()
+        .find(|cell| cell.name == "mem0")
+        .expect("mem0");
+    assert_eq!(cell.kind.as_str(), "blockram");
+
+    let q_net = design
+        .nets
+        .iter()
+        .find(|net| net.name == "q_net")
+        .expect("q_net");
+    assert_eq!(
+        q_net.driver.as_ref().map(|driver| driver.name.as_str()),
+        Some("mem0")
+    );
+    assert_eq!(
+        q_net.driver.as_ref().map(|driver| driver.pin.as_str()),
+        Some("DO0")
+    );
+}
+
+#[test]
 fn parses_string_properties_and_comments() {
     let design = parse_source(
         r#"

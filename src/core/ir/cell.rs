@@ -122,6 +122,10 @@ impl Cell {
         self.primitive_kind().is_buffer()
     }
 
+    pub fn is_block_ram(&self) -> bool {
+        self.primitive_kind().is_block_ram()
+    }
+
     pub fn register_clock_net(&self) -> Option<&str> {
         self.input_net_matching(|primitive, port| primitive.is_clock_pin(port))
     }
