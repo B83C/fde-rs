@@ -1,5 +1,5 @@
 use crate::{
-    domain::{CellKind, EndpointKind, NetOrigin, PrimitiveKind, SiteKind},
+    domain::{CellKind, EndpointKind, NetOrigin, PrimitiveKind, SequentialInitValue, SiteKind},
     ir::{PortDirection, Property},
     resource::TileKind,
 };
@@ -143,6 +143,20 @@ impl DeviceCell {
 
     pub fn primitive_kind(&self) -> PrimitiveKind {
         PrimitiveKind::from_cell_kind(self.kind, &self.type_name)
+    }
+
+    pub fn property(&self, key: &str) -> Option<&str> {
+        self.properties
+            .iter()
+            .find(|property| property.key.eq_ignore_ascii_case(key))
+            .map(|property| property.value.as_str())
+    }
+
+    pub fn register_init_value(&self) -> Option<SequentialInitValue> {
+        self.primitive_kind()
+            .is_sequential()
+            .then(|| self.property("init").and_then(SequentialInitValue::parse))
+            .flatten()
     }
 
     pub fn site_kind_class(&self) -> SiteKind {

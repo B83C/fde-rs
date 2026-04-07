@@ -300,6 +300,31 @@ fn detects_clock_enable_usage_in_site_program() {
 }
 
 #[test]
+fn preserves_high_ff_init_from_imported_cell_properties() {
+    let device = DeviceDesign {
+        cells: vec![
+            DeviceCell::new("ff0", CellKind::Ff, "DFFHQ")
+                .with_properties(vec![Property::new("init", "1")])
+                .placed(SiteKind::LogicSlice, "S0", "FF0", "T0", "CENTER", (0, 0, 0)),
+        ],
+        ..DeviceDesign::default()
+    };
+
+    let slice = logic_slice_program(&device);
+    assert_eq!(
+        slice.slots[0].ff.as_ref().expect("slot0 ff").init,
+        crate::domain::SequentialInitValue::High
+    );
+
+    let requests = compiled_logic_slice_requests(&device, mini_logic_slice_lut_cil());
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.cfg_name == "INITX" && request.function_name == "HIGH")
+    );
+}
+
+#[test]
 fn widens_small_lut_init_to_site_truth_table_width_before_encoding() {
     let device = DeviceDesign {
         cells: vec![

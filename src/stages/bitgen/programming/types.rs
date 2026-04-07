@@ -1,4 +1,8 @@
-use crate::{bitgen::DeviceCell, domain::SiteKind, route::DeviceRoutePip};
+use crate::{
+    bitgen::DeviceCell,
+    domain::{SequentialInitValue, SiteKind},
+    route::DeviceRoutePip,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SiteInstance {
@@ -66,11 +70,6 @@ pub(crate) enum SliceLutOutputUsage {
 pub(crate) struct SequentialProgram {
     pub(crate) init: SequentialInitValue,
     pub(crate) data_path: SliceFfDataPath,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SequentialInitValue {
-    Low,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

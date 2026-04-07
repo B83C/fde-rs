@@ -7,6 +7,7 @@ use super::super::writer::{
     SLICE_DEFAULT_CONFIGS, SliceCellBinding, SliceCellKind, default_config_map, ordered_configs,
     packed_lut_function_name,
 };
+use crate::domain::SequentialInitValue;
 
 pub(super) fn assign_cluster_cells(
     design: &Design,
@@ -67,7 +68,13 @@ pub(super) fn build_slice_configs(
             let b_name = if binding.slot == 0 { "BXMUX" } else { "BYMUX" };
             let xused_name = if binding.slot == 0 { "XUSED" } else { "YUSED" };
             configs.insert(ff_name.to_string(), "#FF".to_string());
-            configs.insert(init_name.to_string(), "LOW".to_string());
+            configs.insert(
+                init_name.to_string(),
+                cell.register_init_value()
+                    .unwrap_or(SequentialInitValue::Low)
+                    .as_config_value()
+                    .to_string(),
+            );
             configs.insert("SYNC_ATTR".to_string(), "ASYNC".to_string());
             configs.insert("CKINV".to_string(), "1".to_string());
             if ff_uses_clock_enable(cell) {
@@ -152,4 +159,36 @@ fn lut_has_routed_sink(
                     && binding.slot.min(1) == slot.min(1))
             })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SliceCellBinding, SliceCellKind, build_slice_configs};
+    use crate::ir::{Cell, CellKind, Design};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn slice_configs_preserve_high_ff_init_property() {
+        let mut ff = Cell::new("ff0", CellKind::Ff, "DFFHQ");
+        ff.set_property("init", "1");
+        let design = Design {
+            cells: vec![ff],
+            ..Design::default()
+        };
+        let bindings = BTreeMap::from([(
+            "ff0".to_string(),
+            SliceCellBinding {
+                slot: 0,
+                kind: SliceCellKind::Sequential,
+            },
+        )]);
+
+        let configs = build_slice_configs(&design, &bindings);
+
+        assert!(
+            configs
+                .iter()
+                .any(|(name, value)| name == "INITX" && value == "HIGH")
+        );
+    }
 }

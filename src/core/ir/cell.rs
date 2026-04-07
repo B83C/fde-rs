@@ -1,5 +1,5 @@
 use crate::domain::ascii::trimmed_contains_ignore_ascii_case;
-use crate::domain::{CellKind, ConstantKind, PrimitiveKind};
+use crate::domain::{CellKind, ConstantKind, PrimitiveKind, SequentialInitValue};
 use serde::{Deserialize, Serialize};
 
 use super::{CellPin, Property};
@@ -138,6 +138,12 @@ impl Cell {
         self.input_net_matching(|primitive, port| primitive.is_set_reset_pin(port))
     }
 
+    pub fn register_init_value(&self) -> Option<SequentialInitValue> {
+        self.is_sequential()
+            .then(|| self.property("init").and_then(SequentialInitValue::parse))
+            .flatten()
+    }
+
     pub fn register_clock_is_inverted(&self) -> bool {
         self.is_sequential()
             && (self.inputs.iter().any(|pin| {
@@ -172,5 +178,16 @@ mod tests {
         assert!(ff.register_clock_is_inverted());
         assert_eq!(ff.register_clock_enable_net(), Some("ce"));
         assert_eq!(ff.register_set_reset_net(), Some("rst"));
+    }
+
+    #[test]
+    fn register_init_value_reads_single_bit_init_property() {
+        let mut ff = Cell::ff("ff0", "DFFHQ");
+        ff.set_property("INIT", "1");
+
+        assert_eq!(
+            ff.register_init_value(),
+            Some(super::SequentialInitValue::High)
+        );
     }
 }

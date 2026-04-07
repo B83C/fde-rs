@@ -4,13 +4,13 @@ use self::block_ram::derive_block_ram_program;
 use std::collections::BTreeMap;
 
 use super::types::{
-    IobProgram, LutProgram, SequentialInitValue, SequentialProgram, SiteInstance, SiteProgram,
-    SiteProgramKind, SliceClockEnableMode, SliceFfDataPath, SliceLutOutputUsage, SliceProgram,
+    IobProgram, LutProgram, SequentialProgram, SiteInstance, SiteProgram, SiteProgramKind,
+    SliceClockEnableMode, SliceFfDataPath, SliceLutOutputUsage, SliceProgram,
 };
 use crate::{
     bitgen::{DeviceCell, DeviceDesign, DeviceEndpoint},
     bitgen::{DeviceDesignIndex, DeviceEndpointRef, literal::normalized_site_lut_truth_table_bits},
-    domain::SiteKind,
+    domain::{SequentialInitValue, SiteKind},
 };
 
 const LOGIC_SLICE_SITE_INPUTS: usize = 4;
@@ -99,7 +99,9 @@ fn derive_slice_program(
         }
         if primitive.is_sequential() {
             program.slots[slot].ff = Some(SequentialProgram {
-                init: SequentialInitValue::Low,
+                init: cell
+                    .register_init_value()
+                    .unwrap_or(SequentialInitValue::Low),
                 data_path: slice_ff_data_path(cell, device, index, slot),
             });
             if slice_ff_uses_clock_enable(cell, device, index) {
@@ -253,10 +255,7 @@ fn slot_of_cell(cell: &DeviceCell, site: &SiteInstance) -> usize {
 }
 
 fn cell_property<'a>(cell: &'a DeviceCell, key: &str) -> Option<&'a str> {
-    cell.properties
-        .iter()
-        .find(|property| property.key.eq_ignore_ascii_case(key))
-        .map(|property| property.value.as_str())
+    cell.property(key)
 }
 
 fn bel_slot(bel: &str) -> Option<usize> {

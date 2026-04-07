@@ -7,6 +7,7 @@ mod net;
 mod pin;
 mod primitive;
 mod routing;
+mod sequential;
 mod site;
 mod timing;
 
@@ -35,5 +36,6 @@ pub use routing::{
     slice_lut_input_wire_prefix, slice_lut_output_wire_name, slice_output_wire_kind,
     slice_register_data_wire_name, slice_register_output_wire_name,
 };
+pub use sequential::SequentialInitValue;
 pub use site::SiteKind;
 pub use timing::TimingPathCategory;

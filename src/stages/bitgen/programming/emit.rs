@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use super::derive::derive_site_programs;
 use super::types::{
     BlockRamProgram, IobProgram, LutProgram, ProgrammedMemory, ProgrammedSite, ProgrammingImage,
-    RequestedConfig, SequentialInitValue, SequentialProgram, SiteProgram, SiteProgramKind,
-    SliceClockEnableMode, SliceFfDataPath, SliceLutOutputUsage, SliceProgram,
+    RequestedConfig, SequentialProgram, SiteProgram, SiteProgramKind, SliceClockEnableMode,
+    SliceFfDataPath, SliceLutOutputUsage, SliceProgram,
 };
 use crate::{
     bitgen::DeviceDesign,
@@ -113,10 +113,7 @@ fn emit_slice_requests(program: &SliceProgram, site_def: &SiteDef) -> Vec<Reques
             });
             requests.push(RequestedConfig {
                 cfg_name: if slot == 0 { "INITX" } else { "INITY" }.to_string(),
-                function_name: match ff.init {
-                    SequentialInitValue::Low => "LOW",
-                }
-                .to_string(),
+                function_name: ff.init.as_config_value().to_string(),
             });
             requests.extend(slice_ff_data_requests(ff, slot));
         }
