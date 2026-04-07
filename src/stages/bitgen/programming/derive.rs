@@ -1,9 +1,11 @@
+mod block_ram;
+
+use self::block_ram::derive_block_ram_program;
 use std::collections::BTreeMap;
 
 use super::types::{
-    BlockRamProgram, IobProgram, LutProgram, SequentialInitValue, SequentialProgram, SiteInstance,
-    SiteProgram, SiteProgramKind, SliceClockEnableMode, SliceFfDataPath, SliceLutOutputUsage,
-    SliceProgram,
+    IobProgram, LutProgram, SequentialInitValue, SequentialProgram, SiteInstance, SiteProgram,
+    SiteProgramKind, SliceClockEnableMode, SliceFfDataPath, SliceLutOutputUsage, SliceProgram,
 };
 use crate::{
     bitgen::{DeviceCell, DeviceDesign, DeviceEndpoint},
@@ -55,9 +57,12 @@ fn derive_site_program(
         SiteKind::LogicSlice => {
             SiteProgramKind::LogicSlice(derive_slice_program(site, device, index))
         }
-        SiteKind::BlockRam => {
-            SiteProgramKind::BlockRam(derive_block_ram_program(site, device, index))
-        }
+        SiteKind::BlockRam => SiteProgramKind::BlockRam(
+            site.cells
+                .first()
+                .map(|cell| derive_block_ram_program(cell, device, index))
+                .unwrap_or_default(),
+        ),
         SiteKind::Iob => SiteProgramKind::Iob(derive_iob_program(site, device, index)),
         SiteKind::Gclk => SiteProgramKind::Gclk,
         SiteKind::GclkIob => SiteProgramKind::GclkIob,
@@ -126,63 +131,6 @@ fn derive_iob_program(
                 .iter()
                 .any(|sink| endpoint_matches_cell_pin(index, device, sink, &cell.cell_name, "OUT"))
         }),
-    }
-}
-
-fn derive_block_ram_program(
-    site: &SiteInstance,
-    device: &DeviceDesign,
-    index: &DeviceDesignIndex<'_>,
-) -> BlockRamProgram {
-    let Some(cell) = site.cells.first() else {
-        return BlockRamProgram::default();
-    };
-
-    let single_port = cell.type_name.eq_ignore_ascii_case("BLOCKRAM_1");
-    let dual_port = cell.type_name.eq_ignore_ascii_case("BLOCKRAM_2");
-
-    BlockRamProgram {
-        port_a_attr: cell_property(cell, "PORTA_ATTR")
-            .or_else(|| {
-                single_port
-                    .then(|| cell_property(cell, "PORT_ATTR"))
-                    .flatten()
-            })
-            .map(str::to_owned),
-        port_b_attr: if dual_port {
-            cell_property(cell, "PORTB_ATTR").map(str::to_owned)
-        } else {
-            None
-        },
-        clka_used: block_ram_sink_pin_used(
-            cell,
-            device,
-            index,
-            if single_port { &["CLK"] } else { &["CLKA"] },
-        ),
-        clkb_used: dual_port && block_ram_sink_pin_used(cell, device, index, &["CLKB"]),
-        ena_used: block_ram_sink_pin_used(
-            cell,
-            device,
-            index,
-            if single_port { &["EN"] } else { &["ENA"] },
-        ),
-        enb_used: dual_port && block_ram_sink_pin_used(cell, device, index, &["ENB"]),
-        wea_used: block_ram_sink_pin_used(
-            cell,
-            device,
-            index,
-            if single_port { &["WE"] } else { &["WEA"] },
-        ),
-        web_used: dual_port && block_ram_sink_pin_used(cell, device, index, &["WEB"]),
-        rsta_used: block_ram_sink_pin_used(
-            cell,
-            device,
-            index,
-            if single_port { &["RST"] } else { &["RSTA"] },
-        ),
-        rstb_used: dual_port && block_ram_sink_pin_used(cell, device, index, &["RSTB"]),
-        init_words: block_ram_init_words(cell),
     }
 }
 
@@ -300,21 +248,6 @@ fn endpoint_matches_cell_pin(
     ) && endpoint.pin == pin_name
 }
 
-fn block_ram_sink_pin_used(
-    cell: &DeviceCell,
-    device: &DeviceDesign,
-    index: &DeviceDesignIndex<'_>,
-    pin_names: &[&str],
-) -> bool {
-    device.nets.iter().any(|net| {
-        net.sinks.iter().any(|sink| {
-            pin_names.iter().any(|pin_name| {
-                endpoint_matches_cell_pin(index, device, sink, &cell.cell_name, pin_name)
-            })
-        })
-    })
-}
-
 fn slot_of_cell(cell: &DeviceCell, site: &SiteInstance) -> usize {
     bel_slot(&cell.bel).unwrap_or(site.z.min(1)).min(1)
 }
@@ -324,22 +257,6 @@ fn cell_property<'a>(cell: &'a DeviceCell, key: &str) -> Option<&'a str> {
         .iter()
         .find(|property| property.key.eq_ignore_ascii_case(key))
         .map(|property| property.value.as_str())
-}
-
-fn block_ram_init_words(cell: &DeviceCell) -> Vec<(String, String)> {
-    let mut words = cell
-        .properties
-        .iter()
-        .filter_map(|property| {
-            property
-                .key
-                .get(..4)
-                .filter(|prefix| prefix.eq_ignore_ascii_case("INIT"))
-                .map(|_| (property.key.to_ascii_uppercase(), property.value.clone()))
-        })
-        .collect::<Vec<_>>();
-    words.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
-    words
 }
 
 fn bel_slot(bel: &str) -> Option<usize> {

@@ -10,7 +10,12 @@ mod routing;
 mod site;
 mod timing;
 
-pub(crate) use block_ram::route_target as block_ram_route_target;
+pub(crate) use block_ram::{
+    BlockRamControlSignal, BlockRamKind, BlockRamPin, BlockRamPortSide, block_ram_port_attr,
+    normalized_init_property_key as normalized_block_ram_init_property_key,
+    parse_ramb4_dual_port_widths, parse_ramb4_single_port_width,
+    route_target as block_ram_route_target,
+};
 pub use cell::CellKind;
 pub use cluster::ClusterKind;
 pub use endpoint::EndpointKind;

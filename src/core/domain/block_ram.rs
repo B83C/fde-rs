@@ -1,136 +1,375 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockRamKind {
+    SinglePort,
+    DualPort,
+}
+
+impl BlockRamKind {
+    pub(crate) fn from_type_name(type_name: &str) -> Option<Self> {
+        match type_name.trim() {
+            name if name.eq_ignore_ascii_case("BLOCKRAM_1") => Some(Self::SinglePort),
+            name if name.eq_ignore_ascii_case("BLOCKRAM_2") => Some(Self::DualPort),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn canonical_type_name(self) -> &'static str {
+        match self {
+            Self::SinglePort => "BLOCKRAM_1",
+            Self::DualPort => "BLOCKRAM_2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockRamPortSide {
+    A,
+    B,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockRamControlSignal {
+    Clock,
+    WriteEnable,
+    Reset,
+    Enable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockRamPin {
+    Control {
+        side: BlockRamPortSide,
+        signal: BlockRamControlSignal,
+    },
+    DataIn {
+        side: BlockRamPortSide,
+        index: usize,
+    },
+    DataOut {
+        side: BlockRamPortSide,
+        index: usize,
+    },
+    Addr {
+        side: BlockRamPortSide,
+        index: usize,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockRamRouteTarget {
     pub(crate) wire_name: String,
     pub(crate) row_offset: isize,
 }
 
+impl BlockRamPin {
+    pub(crate) fn parse(pin: &str) -> Option<Self> {
+        let normalized = pin.trim();
+        let normalized = normalized
+            .strip_prefix("BRAM_")
+            .or_else(|| normalized.strip_prefix("bram_"))
+            .unwrap_or(normalized);
+
+        if matches_any(normalized, &["CLK", "CKA", "CLKA"]) {
+            return Some(Self::control(
+                BlockRamPortSide::A,
+                BlockRamControlSignal::Clock,
+            ));
+        }
+        if matches_any(normalized, &["WE", "AWE", "WEA"]) {
+            return Some(Self::control(
+                BlockRamPortSide::A,
+                BlockRamControlSignal::WriteEnable,
+            ));
+        }
+        if matches_any(normalized, &["RST", "RSTA"]) {
+            return Some(Self::control(
+                BlockRamPortSide::A,
+                BlockRamControlSignal::Reset,
+            ));
+        }
+        if matches_any(normalized, &["EN", "ENA", "AEN", "SELA"]) {
+            return Some(Self::control(
+                BlockRamPortSide::A,
+                BlockRamControlSignal::Enable,
+            ));
+        }
+        if matches_any(normalized, &["CLKB", "CKB"]) {
+            return Some(Self::control(
+                BlockRamPortSide::B,
+                BlockRamControlSignal::Clock,
+            ));
+        }
+        if matches_any(normalized, &["WEB", "BWE"]) {
+            return Some(Self::control(
+                BlockRamPortSide::B,
+                BlockRamControlSignal::WriteEnable,
+            ));
+        }
+        if matches_any(normalized, &["RSTB"]) {
+            return Some(Self::control(
+                BlockRamPortSide::B,
+                BlockRamControlSignal::Reset,
+            ));
+        }
+        if matches_any(normalized, &["ENB", "BEN", "SELB"]) {
+            return Some(Self::control(
+                BlockRamPortSide::B,
+                BlockRamControlSignal::Enable,
+            ));
+        }
+        if matches_any(normalized, &["DI", "DIA"]) {
+            return Some(Self::DataIn {
+                side: BlockRamPortSide::A,
+                index: 0,
+            });
+        }
+        if matches_any(normalized, &["DO", "DOA"]) {
+            return Some(Self::DataOut {
+                side: BlockRamPortSide::A,
+                index: 0,
+            });
+        }
+        if matches_any(normalized, &["DIB"]) {
+            return Some(Self::DataIn {
+                side: BlockRamPortSide::B,
+                index: 0,
+            });
+        }
+        if matches_any(normalized, &["DOB"]) {
+            return Some(Self::DataOut {
+                side: BlockRamPortSide::B,
+                index: 0,
+            });
+        }
+
+        if let Some(index) = parse_indexed_pin(normalized, "DI") {
+            return Some(Self::DataIn {
+                side: BlockRamPortSide::A,
+                index,
+            });
+        }
+        if let Some(index) = parse_indexed_pin(normalized, "DO") {
+            return Some(Self::DataOut {
+                side: BlockRamPortSide::A,
+                index,
+            });
+        }
+        if let Some(index) = parse_indexed_pin(normalized, "ADDR") {
+            return Some(Self::Addr {
+                side: BlockRamPortSide::A,
+                index,
+            });
+        }
+        if let Some(index) = parse_indexed_pin(normalized, "DIA") {
+            return Some(Self::DataIn {
+                side: BlockRamPortSide::A,
+                index,
+            });
+        }
+        if let Some(index) = parse_indexed_pin(normalized, "DOA") {
+            return Some(Self::DataOut {
+                side: BlockRamPortSide::A,
+                index,
+            });
+        }
+        if let Some(index) = parse_indexed_pin(normalized, "ADDRA") {
+            return Some(Self::Addr {
+                side: BlockRamPortSide::A,
+                index,
+            });
+        }
+        if let Some(index) = parse_indexed_pin(normalized, "DIB") {
+            return Some(Self::DataIn {
+                side: BlockRamPortSide::B,
+                index,
+            });
+        }
+        if let Some(index) = parse_indexed_pin(normalized, "DOB") {
+            return Some(Self::DataOut {
+                side: BlockRamPortSide::B,
+                index,
+            });
+        }
+        parse_indexed_pin(normalized, "ADDRB").map(|index| Self::Addr {
+            side: BlockRamPortSide::B,
+            index,
+        })
+    }
+
+    pub(crate) fn route_target(self) -> Option<BlockRamRouteTarget> {
+        Some(BlockRamRouteTarget {
+            wire_name: format!("BRAM_{}", self.route_pin_name()),
+            row_offset: self.row_offset()?,
+        })
+    }
+
+    pub(crate) fn canonical_map_name(
+        self,
+        kind: BlockRamKind,
+        addr_shift_a: usize,
+        addr_shift_b: usize,
+    ) -> Option<String> {
+        match (kind, self) {
+            (
+                BlockRamKind::SinglePort,
+                Self::Control {
+                    side: BlockRamPortSide::A,
+                    signal,
+                },
+            ) => Some(
+                match signal {
+                    BlockRamControlSignal::Clock => "CLK",
+                    BlockRamControlSignal::WriteEnable => "WE",
+                    BlockRamControlSignal::Reset => "RST",
+                    BlockRamControlSignal::Enable => "EN",
+                }
+                .to_string(),
+            ),
+            (
+                BlockRamKind::SinglePort,
+                Self::DataIn {
+                    side: BlockRamPortSide::A,
+                    index,
+                },
+            ) => Some(format!("DI{index}")),
+            (
+                BlockRamKind::SinglePort,
+                Self::DataOut {
+                    side: BlockRamPortSide::A,
+                    index,
+                },
+            ) => Some(format!("DO{index}")),
+            (
+                BlockRamKind::SinglePort,
+                Self::Addr {
+                    side: BlockRamPortSide::A,
+                    index,
+                },
+            ) => Some(format!("ADDR{}", index + addr_shift_a)),
+            (BlockRamKind::SinglePort, _) => None,
+            (BlockRamKind::DualPort, Self::Control { side, signal }) => {
+                Some(dual_port_control_name(side, signal).to_string())
+            }
+            (BlockRamKind::DualPort, Self::DataIn { side, index }) => Some(match side {
+                BlockRamPortSide::A => format!("DIA{index}"),
+                BlockRamPortSide::B => format!("DIB{index}"),
+            }),
+            (BlockRamKind::DualPort, Self::DataOut { side, index }) => Some(match side {
+                BlockRamPortSide::A => format!("DOA{index}"),
+                BlockRamPortSide::B => format!("DOB{index}"),
+            }),
+            (BlockRamKind::DualPort, Self::Addr { side, index }) => Some(match side {
+                BlockRamPortSide::A => format!("ADDRA{}", index + addr_shift_a),
+                BlockRamPortSide::B => format!("ADDRB{}", index + addr_shift_b),
+            }),
+        }
+    }
+
+    fn control(side: BlockRamPortSide, signal: BlockRamControlSignal) -> Self {
+        Self::Control { side, signal }
+    }
+
+    fn route_pin_name(self) -> String {
+        match self {
+            Self::Control { side, signal } => match (side, signal) {
+                (BlockRamPortSide::A, BlockRamControlSignal::Clock) => "CLKA".to_string(),
+                (BlockRamPortSide::A, BlockRamControlSignal::WriteEnable) => "WEA".to_string(),
+                (BlockRamPortSide::A, BlockRamControlSignal::Reset) => "RSTA".to_string(),
+                (BlockRamPortSide::A, BlockRamControlSignal::Enable) => "SELA".to_string(),
+                (BlockRamPortSide::B, BlockRamControlSignal::Clock) => "CLKB".to_string(),
+                (BlockRamPortSide::B, BlockRamControlSignal::WriteEnable) => "WEB".to_string(),
+                (BlockRamPortSide::B, BlockRamControlSignal::Reset) => "RSTB".to_string(),
+                (BlockRamPortSide::B, BlockRamControlSignal::Enable) => "SELB".to_string(),
+            },
+            Self::DataIn { side, index } => match side {
+                BlockRamPortSide::A => format!("DIA{index}"),
+                BlockRamPortSide::B => format!("DIB{index}"),
+            },
+            Self::DataOut { side, index } => match side {
+                BlockRamPortSide::A => format!("DOA{index}"),
+                BlockRamPortSide::B => format!("DOB{index}"),
+            },
+            Self::Addr { side, index } => match side {
+                BlockRamPortSide::A => format!("ADDRA{index}"),
+                BlockRamPortSide::B => format!("ADDRB{index}"),
+            },
+        }
+    }
+
+    fn row_offset(self) -> Option<isize> {
+        match self {
+            Self::Control {
+                side: BlockRamPortSide::A,
+                ..
+            } => Some(-2),
+            Self::Control {
+                side: BlockRamPortSide::B,
+                ..
+            } => Some(-1),
+            Self::Addr { index, .. } => Some((index / 4) as isize - 2),
+            Self::DataOut { index, .. } => Some(index as isize % 4 - 3),
+            Self::DataIn { index, .. } => match index {
+                0 | 2 | 8 | 10 => Some(-3),
+                1 | 3 | 9 | 11 => Some(-2),
+                4 | 5 | 12 | 13 => Some(-1),
+                6 | 7 | 14 | 15 => Some(0),
+                _ => None,
+            },
+        }
+    }
+}
+
 pub(crate) fn route_target(pin: &str) -> Option<BlockRamRouteTarget> {
-    let raw_pin = normalized_route_pin(pin)?;
-    Some(BlockRamRouteTarget {
-        wire_name: format!("BRAM_{raw_pin}"),
-        row_offset: row_offset_for_raw_pin(&raw_pin)?,
-    })
+    BlockRamPin::parse(pin)?.route_target()
 }
 
-fn normalized_route_pin(pin: &str) -> Option<String> {
-    let pin = pin.trim();
-    if let Some(raw) = pin.strip_prefix("BRAM_") {
-        return Some(raw.to_ascii_uppercase());
+pub(crate) fn parse_ramb4_single_port_width(type_name: &str) -> Option<usize> {
+    let suffix = type_name.trim().strip_prefix("RAMB4_")?;
+    if suffix.contains('_') {
+        return None;
     }
-
-    if pin.eq_ignore_ascii_case("CLK") || pin.eq_ignore_ascii_case("CKA") {
-        return Some("CLKA".to_string());
-    }
-    if pin.eq_ignore_ascii_case("WE") || pin.eq_ignore_ascii_case("AWE") {
-        return Some("WEA".to_string());
-    }
-    if pin.eq_ignore_ascii_case("RST") {
-        return Some("RSTA".to_string());
-    }
-    if pin.eq_ignore_ascii_case("EN")
-        || pin.eq_ignore_ascii_case("ENA")
-        || pin.eq_ignore_ascii_case("AEN")
-    {
-        return Some("SELA".to_string());
-    }
-    if pin.eq_ignore_ascii_case("CLKB") || pin.eq_ignore_ascii_case("CKB") {
-        return Some("CLKB".to_string());
-    }
-    if pin.eq_ignore_ascii_case("WEB") || pin.eq_ignore_ascii_case("BWE") {
-        return Some("WEB".to_string());
-    }
-    if pin.eq_ignore_ascii_case("RSTB") {
-        return Some("RSTB".to_string());
-    }
-    if pin.eq_ignore_ascii_case("ENB") || pin.eq_ignore_ascii_case("BEN") {
-        return Some("SELB".to_string());
-    }
-    if pin.eq_ignore_ascii_case("CLKA")
-        || pin.eq_ignore_ascii_case("WEA")
-        || pin.eq_ignore_ascii_case("RSTA")
-        || pin.eq_ignore_ascii_case("SELA")
-        || pin.eq_ignore_ascii_case("CLKB")
-        || pin.eq_ignore_ascii_case("WEB")
-        || pin.eq_ignore_ascii_case("RSTB")
-        || pin.eq_ignore_ascii_case("SELB")
-    {
-        return Some(pin.to_ascii_uppercase());
-    }
-    if pin.eq_ignore_ascii_case("DI") {
-        return Some("DIA0".to_string());
-    }
-    if pin.eq_ignore_ascii_case("DO") {
-        return Some("DOA0".to_string());
-    }
-    if pin.eq_ignore_ascii_case("DIA") {
-        return Some("DIA0".to_string());
-    }
-    if pin.eq_ignore_ascii_case("DOA") {
-        return Some("DOA0".to_string());
-    }
-    if pin.eq_ignore_ascii_case("DIB") {
-        return Some("DIB0".to_string());
-    }
-    if pin.eq_ignore_ascii_case("DOB") {
-        return Some("DOB0".to_string());
-    }
-
-    if let Some(index) = parse_indexed_pin(pin, "DI") {
-        return Some(format!("DIA{index}"));
-    }
-    if let Some(index) = parse_indexed_pin(pin, "DO") {
-        return Some(format!("DOA{index}"));
-    }
-    if let Some(index) = parse_indexed_pin(pin, "ADDR") {
-        return Some(format!("ADDRA{index}"));
-    }
-    if let Some(index) = parse_indexed_pin(pin, "DIA") {
-        return Some(format!("DIA{index}"));
-    }
-    if let Some(index) = parse_indexed_pin(pin, "DOA") {
-        return Some(format!("DOA{index}"));
-    }
-    if let Some(index) = parse_indexed_pin(pin, "ADDRA") {
-        return Some(format!("ADDRA{index}"));
-    }
-    if let Some(index) = parse_indexed_pin(pin, "DIB") {
-        return Some(format!("DIB{index}"));
-    }
-    if let Some(index) = parse_indexed_pin(pin, "DOB") {
-        return Some(format!("DOB{index}"));
-    }
-    parse_indexed_pin(pin, "ADDRB").map(|index| format!("ADDRB{index}"))
+    parse_ramb4_width_token(suffix)
 }
 
-fn row_offset_for_raw_pin(raw_pin: &str) -> Option<isize> {
-    if matches!(raw_pin, "CLKA" | "WEA" | "SELA" | "RSTA") {
-        return Some(-2);
+pub(crate) fn parse_ramb4_dual_port_widths(type_name: &str) -> Option<(usize, usize)> {
+    let suffix = type_name.trim().strip_prefix("RAMB4_")?;
+    let (port_a, port_b) = suffix.split_once('_')?;
+    Some((
+        parse_ramb4_width_token(port_a)?,
+        parse_ramb4_width_token(port_b)?,
+    ))
+}
+
+pub(crate) fn block_ram_port_attr(width: usize) -> String {
+    format!("{}X{width}", 4096 / width.max(1))
+}
+
+pub(crate) fn normalized_init_property_key(key: &str) -> Option<String> {
+    key.get(..4)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("INIT"))
+        .map(|_| key.to_ascii_uppercase())
+}
+
+fn dual_port_control_name(side: BlockRamPortSide, signal: BlockRamControlSignal) -> &'static str {
+    match (side, signal) {
+        (BlockRamPortSide::A, BlockRamControlSignal::Clock) => "CLKA",
+        (BlockRamPortSide::A, BlockRamControlSignal::WriteEnable) => "WEA",
+        (BlockRamPortSide::A, BlockRamControlSignal::Reset) => "RSTA",
+        (BlockRamPortSide::A, BlockRamControlSignal::Enable) => "ENA",
+        (BlockRamPortSide::B, BlockRamControlSignal::Clock) => "CLKB",
+        (BlockRamPortSide::B, BlockRamControlSignal::WriteEnable) => "WEB",
+        (BlockRamPortSide::B, BlockRamControlSignal::Reset) => "RSTB",
+        (BlockRamPortSide::B, BlockRamControlSignal::Enable) => "ENB",
     }
-    if matches!(raw_pin, "CLKB" | "WEB" | "SELB" | "RSTB") {
-        return Some(-1);
-    }
-    if let Some(index) =
-        parse_indexed_pin(raw_pin, "ADDRA").or_else(|| parse_indexed_pin(raw_pin, "ADDRB"))
-    {
-        return Some((index / 4) as isize - 2);
-    }
-    if let Some(index) =
-        parse_indexed_pin(raw_pin, "DOA").or_else(|| parse_indexed_pin(raw_pin, "DOB"))
-    {
-        return Some(index as isize % 4 - 3);
-    }
-    if let Some(index) =
-        parse_indexed_pin(raw_pin, "DIA").or_else(|| parse_indexed_pin(raw_pin, "DIB"))
-    {
-        return Some(match index {
-            0 | 2 | 8 | 10 => -3,
-            1 | 3 | 9 | 11 => -2,
-            4 | 5 | 12 | 13 => -1,
-            6 | 7 | 14 | 15 => 0,
-            _ => return None,
-        });
-    }
-    None
+}
+
+fn matches_any(pin: &str, aliases: &[&str]) -> bool {
+    aliases.iter().any(|alias| pin.eq_ignore_ascii_case(alias))
+}
+
+fn parse_ramb4_width_token(token: &str) -> Option<usize> {
+    let width = token.strip_prefix('S')?.parse::<usize>().ok()?;
+    matches!(width, 1 | 2 | 4 | 8 | 16).then_some(width)
 }
 
 fn parse_indexed_pin(pin: &str, prefix: &str) -> Option<usize> {
@@ -149,7 +388,10 @@ fn parse_indexed_pin(pin: &str, prefix: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::route_target;
+    use super::{
+        BlockRamKind, BlockRamPin, block_ram_port_attr, normalized_init_property_key,
+        parse_ramb4_dual_port_widths, parse_ramb4_single_port_width, route_target,
+    };
 
     #[test]
     fn maps_single_port_block_ram_pins_to_cpp_style_route_targets() {
@@ -201,5 +443,53 @@ mod tests {
         assert_eq!(addrb0.row_offset, -2);
         assert_eq!(enb.wire_name, "BRAM_SELB");
         assert_eq!(enb.row_offset, -1);
+    }
+
+    #[test]
+    fn canonicalizes_map_pin_names_via_typed_bram_pins() {
+        assert_eq!(
+            BlockRamPin::parse("DIA[0]").and_then(|pin| pin.canonical_map_name(
+                BlockRamKind::DualPort,
+                0,
+                4
+            )),
+            Some("DIA0".to_string())
+        );
+        assert_eq!(
+            BlockRamPin::parse("ADDRB[7]").and_then(|pin| pin.canonical_map_name(
+                BlockRamKind::DualPort,
+                0,
+                4
+            )),
+            Some("ADDRB11".to_string())
+        );
+        assert_eq!(
+            BlockRamPin::parse("CLKA").and_then(|pin| pin.canonical_map_name(
+                BlockRamKind::SinglePort,
+                0,
+                0
+            )),
+            Some("CLK".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_ramb4_type_widths_and_attrs() {
+        assert_eq!(parse_ramb4_single_port_width("RAMB4_S8"), Some(8));
+        assert_eq!(parse_ramb4_dual_port_widths("RAMB4_S1_S16"), Some((1, 16)));
+        assert_eq!(block_ram_port_attr(16), "256X16");
+    }
+
+    #[test]
+    fn normalizes_init_property_keys_case_insensitively() {
+        assert_eq!(
+            normalized_init_property_key("init_0f"),
+            Some("INIT_0F".to_string())
+        );
+        assert_eq!(
+            normalized_init_property_key("INIT_00"),
+            Some("INIT_00".to_string())
+        );
+        assert_eq!(normalized_init_property_key("PORT_ATTR"), None);
     }
 }
