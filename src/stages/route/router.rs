@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 
@@ -124,10 +124,6 @@ fn route_device_design_internal(
     cil: &Cil,
     reporter: &mut Option<&mut dyn StageReporter>,
 ) -> Result<DeviceRouteImage> {
-    if reporter.as_deref().is_some_and(StageReporter::is_cancelled) {
-        return Err(anyhow!("route cancelled"));
-    }
-
     emit_stage_info(reporter, "route", "loading routing resources");
     let mut resources = load_route_resources(arch, arch_path, cil)?;
     let index = DeviceDesignIndex::build(device);
@@ -158,9 +154,6 @@ fn route_device_design_internal(
 
     let mut routed_net_count = 0usize;
     for net_index in net_order {
-        if reporter.as_deref().is_some_and(StageReporter::is_cancelled) {
-            return Err(anyhow!("route cancelled"));
-        }
         let should_route = should_route_device_net(&device.nets[net_index]);
         route_net(
             &mut context,
@@ -433,7 +426,6 @@ fn route_net_sink(
     let guide_distances = GuideDistances::new(context.arch, sink_guide);
 
     for sink_wires in sink_wire_groups {
-        let reporter_view = reporter.as_deref().map(|value| value as &dyn StageReporter);
         let spec = SinkRouteSpec {
             net_index: prepared.net_index,
             net_origin: prepared.net_origin,
@@ -451,7 +443,6 @@ fn route_net_sink(
             sink_x: sink.x,
             sink_y: sink.y,
             sink_wires: sink_wires.as_slice(),
-            reporter: reporter_view,
         };
 
         let Some((path, guide_mode)) = route_sink(
@@ -683,7 +674,6 @@ pub(super) struct SinkRouteSpec<'a> {
     pub(super) sink_x: usize,
     pub(super) sink_y: usize,
     pub(super) sink_wires: &'a [WireId],
-    pub(super) reporter: Option<&'a dyn StageReporter>,
 }
 
 fn ordered_start_nodes(spec: &SinkRouteSpec<'_>) -> SmallVec<[RouteNode; 8]> {
@@ -983,9 +973,6 @@ where
     let mut next_order = frontier.len();
 
     while let Some(state) = frontier_heap_pop(frontier) {
-        if spec.reporter.is_some_and(StageReporter::is_cancelled) {
-            return None;
-        }
         if is_goal(state.node) {
             return Some(reconstruct_search_path(
                 context,
