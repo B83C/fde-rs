@@ -41,6 +41,10 @@ pub enum StageEvent {
 
 pub trait StageReporter {
     fn on_stage_event(&mut self, event: StageEvent);
+
+    fn is_cancelled(&self) -> bool {
+        false
+    }
 }
 
 impl<F> StageReporter for F

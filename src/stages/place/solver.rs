@@ -74,6 +74,10 @@ fn solve_internal(
     reporter: &mut Option<&mut dyn StageReporter>,
     incremental_override: Option<bool>,
 ) -> Result<PlacementSolution> {
+    if reporter.as_deref().is_some_and(StageReporter::is_cancelled) {
+        return Err(anyhow!("placement cancelled"));
+    }
+
     let sites = options
         .arch
         .logic_sites()
@@ -401,6 +405,9 @@ fn solve_incremental(
     );
 
     for step in 0..iterations {
+        if reporter.as_deref().is_some_and(StageReporter::is_cancelled) {
+            return Err(anyhow!("placement cancelled"));
+        }
         if should_log_progress(step, iterations) {
             emit_anneal_progress(
                 reporter,
@@ -470,12 +477,7 @@ fn solve_incremental(
             best.metrics.total
         ),
     );
-    Ok(refine_solution(
-        context,
-        best.placements,
-        best.metrics,
-        reporter,
-    ))
+    refine_solution(context, best.placements, best.metrics, reporter)
 }
 
 fn best_full_trial(
@@ -575,6 +577,9 @@ fn solve_full(
     );
 
     for step in 0..iterations {
+        if reporter.as_deref().is_some_and(StageReporter::is_cancelled) {
+            return Err(anyhow!("placement cancelled"));
+        }
         if should_log_progress(step, iterations) {
             emit_anneal_progress(
                 reporter,
@@ -641,12 +646,7 @@ fn solve_full(
             best.metrics.total
         ),
     );
-    Ok(refine_solution(
-        context,
-        best.placements,
-        best.metrics,
-        reporter,
-    ))
+    refine_solution(context, best.placements, best.metrics, reporter)
 }
 
 fn refine_solution(
@@ -654,7 +654,7 @@ fn refine_solution(
     placements: Vec<Option<Point>>,
     metrics: PlacementMetrics,
     reporter: &mut Option<&mut dyn StageReporter>,
-) -> PlacementSolution {
+) -> Result<PlacementSolution> {
     let mut evaluator = PlacementEvaluator::new_from_positions(
         context.model,
         context.graph,
@@ -664,10 +664,10 @@ fn refine_solution(
         context.options.mode,
     );
     if evaluator.metrics().total > metrics.total + 1e-9 {
-        return PlacementSolution {
+        return Ok(PlacementSolution {
             placements: evaluator.placements().to_vec(),
             metrics: evaluator.metrics().clone(),
-        };
+        });
     }
 
     let mut occupancy = occupancy_map(
@@ -688,8 +688,14 @@ fn refine_solution(
     );
 
     for pass_index in 0..pass_limit {
+        if reporter.as_deref().is_some_and(StageReporter::is_cancelled) {
+            return Err(anyhow!("placement cancelled"));
+        }
         let mut improved = false;
         for &focus in &focus_order {
+            if reporter.as_deref().is_some_and(StageReporter::is_cancelled) {
+                return Err(anyhow!("placement cancelled"));
+            }
             let candidates = refinement_targets(context, focus, evaluator.placements());
             let mut best_trial: Option<PlacementCandidate> = None;
             for target in candidates {
@@ -754,10 +760,10 @@ fn refine_solution(
             evaluator.metrics().total
         ),
     );
-    PlacementSolution {
+    Ok(PlacementSolution {
         placements: evaluator.placements().to_vec(),
         metrics: evaluator.metrics().clone(),
-    }
+    })
 }
 
 fn refinement_focus_order(context: &SolveContext<'_>) -> Vec<ClusterId> {

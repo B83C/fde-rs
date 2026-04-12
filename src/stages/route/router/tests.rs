@@ -310,6 +310,7 @@ fn ordered_start_nodes_prioritize_existing_tree_frontier() {
         sink_x: 5,
         sink_y: 5,
         sink_wires: &sink_wires,
+        reporter: None,
     };
 
     assert_eq!(
@@ -348,6 +349,7 @@ fn ordered_start_nodes_prefer_lower_tree_cost_over_nearer_frontier() {
         sink_x: 5,
         sink_y: 5,
         sink_wires: &sink_wires,
+        reporter: None,
     };
 
     assert_eq!(
@@ -398,6 +400,7 @@ fn dedicated_clock_search_reaches_real_arch_clock_sink() {
         sink_x: 3,
         sink_y: 31,
         sink_wires: &sink_wires,
+        reporter: None,
     };
     let context = super::RouteSinkContext {
         arch: &arch,
