@@ -2,7 +2,7 @@ use super::DEFAULT_PACK_CAPACITY;
 use crate::{
     domain::ClusterKind,
     ir::{CellId, Cluster, Design, DesignIndex},
-    report::{StageOutput, StageReport},
+    report::{StageOutput, StageReport, StageReporter, emit_stage_info},
 };
 use anyhow::Result;
 use std::{collections::BTreeSet, path::PathBuf};
@@ -73,29 +73,88 @@ struct ClusterPlan {
     capacity: usize,
 }
 
-pub fn run(mut design: Design, options: &PackOptions) -> Result<StageOutput<Design>> {
+pub fn run(design: Design, options: &PackOptions) -> Result<StageOutput<Design>> {
+    run_internal(design, options, None)
+}
+
+pub fn run_with_reporter(
+    design: Design,
+    options: &PackOptions,
+    reporter: &mut dyn StageReporter,
+) -> Result<StageOutput<Design>> {
+    run_internal(design, options, Some(reporter))
+}
+
+fn run_internal(
+    mut design: Design,
+    options: &PackOptions,
+    mut reporter: Option<&mut dyn StageReporter>,
+) -> Result<StageOutput<Design>> {
     let capacity = options.capacity.max(2);
     design.stage = "packed".to_string();
+    emit_stage_info(
+        &mut reporter,
+        "pack",
+        format!(
+            "packing {} cells into clusters with capacity {}",
+            design.cells.len(),
+            capacity
+        ),
+    );
     if let Some(family) = &options.family {
         design.metadata.family = family.clone();
+        emit_stage_info(
+            &mut reporter,
+            "pack",
+            format!("targeting family {}", family),
+        );
     }
     if let Some(cell_library) = &options.cell_library {
         design.note_once(format!(
             "Pack referenced cell library {}",
             cell_library.display()
         ));
+        emit_stage_info(
+            &mut reporter,
+            "pack",
+            format!("using pack cell library {}", cell_library.display()),
+        );
     }
     if let Some(dcp_library) = &options.dcp_library {
         design.note_once(format!(
             "Pack referenced dc library {}",
             dcp_library.display()
         ));
+        emit_stage_info(
+            &mut reporter,
+            "pack",
+            format!("using pack DCP library {}", dcp_library.display()),
+        );
     }
     if let Some(config) = &options.config {
         design.note_once(format!("Pack referenced config {}", config.display()));
+        emit_stage_info(
+            &mut reporter,
+            "pack",
+            format!("using pack config {}", config.display()),
+        );
     }
 
     let cluster_plans = build_cluster_plans(&design, capacity);
+    let block_ram_cluster_count = cluster_plans
+        .iter()
+        .filter(|plan| plan.kind == ClusterKind::BlockRam)
+        .count();
+    emit_stage_info(
+        &mut reporter,
+        "pack",
+        format!(
+            "built {} cluster plans ({} block RAM, {} logic)",
+            cluster_plans.len(),
+            block_ram_cluster_count,
+            cluster_plans.len().saturating_sub(block_ram_cluster_count)
+        ),
+    );
     let clusters = cluster_plans
         .iter()
         .enumerate()
@@ -113,6 +172,15 @@ pub fn run(mut design: Design, options: &PackOptions) -> Result<StageOutput<Desi
     }
 
     design.clusters = clusters;
+    emit_stage_info(
+        &mut reporter,
+        "pack",
+        format!(
+            "assigned {} cells across {} clusters",
+            design.cells.len(),
+            design.clusters.len()
+        ),
+    );
     let mut report = StageReport::new("pack");
     report.metric("logical_cell_count", design.cells.len());
     report.metric("cluster_count", design.clusters.len());

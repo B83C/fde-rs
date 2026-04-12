@@ -1,7 +1,7 @@
 use super::{rewrite::rewrite_design, verilog::export_structural_verilog};
 use crate::{
     ir::Design,
-    report::{StageOutput, StageReport},
+    report::{StageOutput, StageReport, StageReporter, emit_stage_info},
 };
 use anyhow::Result;
 use std::path::PathBuf;
@@ -29,24 +29,67 @@ pub struct MapArtifact {
     pub structural_verilog: Option<String>,
 }
 
-pub fn run(mut design: Design, options: &MapOptions) -> Result<StageOutput<MapArtifact>> {
+pub fn run(design: Design, options: &MapOptions) -> Result<StageOutput<MapArtifact>> {
+    run_internal(design, options, None)
+}
+
+pub fn run_with_reporter(
+    design: Design,
+    options: &MapOptions,
+    reporter: &mut dyn StageReporter,
+) -> Result<StageOutput<MapArtifact>> {
+    run_internal(design, options, Some(reporter))
+}
+
+fn run_internal(
+    mut design: Design,
+    options: &MapOptions,
+    mut reporter: Option<&mut dyn StageReporter>,
+) -> Result<StageOutput<MapArtifact>> {
     design.stage = "mapped".to_string();
     design.metadata.lut_size = options.lut_size;
     if design.metadata.source_format.is_empty() {
         design.metadata.source_format = "ir".to_string();
     }
+    emit_stage_info(
+        &mut reporter,
+        "map",
+        format!(
+            "mapping design '{}' with LUT size {}",
+            design.name, options.lut_size
+        ),
+    );
     if let Some(cell_library) = &options.cell_library {
         design.note_once(format!(
             "Mapping referenced cell library {}",
             cell_library.display()
         ));
+        emit_stage_info(
+            &mut reporter,
+            "map",
+            format!("using cell library {}", cell_library.display()),
+        );
     }
 
     let summary = rewrite_design(&mut design, options)?;
+    emit_stage_info(
+        &mut reporter,
+        "map",
+        format!(
+            "rewrite complete: {} cells, {} nets, {} normalized LUTs, {} block RAMs",
+            design.cells.len(),
+            design.nets.len(),
+            summary.normalized_luts,
+            summary.normalized_block_rams
+        ),
+    );
 
     let structural_verilog = options
         .emit_structural_verilog
         .then(|| export_structural_verilog(&design));
+    if structural_verilog.is_some() {
+        emit_stage_info(&mut reporter, "map", "emitted structural Verilog artifact");
+    }
 
     let mut report = StageReport::new("map");
     report.metric("cell_count", design.cells.len());

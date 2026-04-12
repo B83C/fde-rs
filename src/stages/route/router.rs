@@ -27,6 +27,7 @@ use crate::{
     DeviceCell, DeviceDesign, DeviceDesignIndex, DeviceEndpoint, DeviceNet,
     cil::Cil,
     domain::{NetOrigin, is_clock_sink_wire_name},
+    report::{StageReporter, emit_stage_info, emit_stage_progress, emit_stage_warning},
     resource::{
         Arch,
         routing::{
@@ -102,6 +103,28 @@ pub fn route_device_design(
     arch_path: &std::path::Path,
     cil: &Cil,
 ) -> Result<DeviceRouteImage> {
+    let mut logger = None;
+    route_device_design_internal(device, arch, arch_path, cil, &mut logger)
+}
+
+pub fn route_device_design_with_reporter(
+    device: &DeviceDesign,
+    arch: &Arch,
+    arch_path: &std::path::Path,
+    cil: &Cil,
+    reporter: &mut dyn StageReporter,
+) -> Result<DeviceRouteImage> {
+    route_device_design_internal(device, arch, arch_path, cil, &mut Some(reporter))
+}
+
+fn route_device_design_internal(
+    device: &DeviceDesign,
+    arch: &Arch,
+    arch_path: &std::path::Path,
+    cil: &Cil,
+    reporter: &mut Option<&mut dyn StageReporter>,
+) -> Result<DeviceRouteImage> {
+    emit_stage_info(reporter, "route", "loading routing resources");
     let mut resources = load_route_resources(arch, arch_path, cil)?;
     let index = DeviceDesignIndex::build(device);
     let mut state = RoutingState::new();
@@ -113,15 +136,83 @@ pub fn route_device_design(
         wires: &mut resources.wires,
     };
 
-    for net_index in route_net_order(device, &index) {
-        route_net(&mut context, device, &index, net_index, &mut state);
+    let net_order = route_net_order(device, &index);
+    let routeable_net_total = net_order
+        .iter()
+        .filter(|&&net_index| should_route_device_net(&device.nets[net_index]))
+        .count();
+    let progress_interval = (routeable_net_total / 20).max(1);
+    emit_stage_info(
+        reporter,
+        "route",
+        format!(
+            "routing {} routable nets ({} total nets)",
+            routeable_net_total,
+            device.nets.len()
+        ),
+    );
+
+    let mut routed_net_count = 0usize;
+    for net_index in net_order {
+        let should_route = should_route_device_net(&device.nets[net_index]);
+        route_net(
+            &mut context,
+            device,
+            &index,
+            net_index,
+            &mut state,
+            reporter,
+        );
+        if should_route {
+            routed_net_count += 1;
+            if routed_net_count == 1
+                || routed_net_count == routeable_net_total
+                || routed_net_count.is_multiple_of(progress_interval)
+            {
+                emit_stage_progress(
+                    reporter,
+                    "route",
+                    format!(
+                        "routed {}/{} nets ({:.0}%), pips={}, notes={}",
+                        routed_net_count,
+                        routeable_net_total,
+                        (routed_net_count as f64 / routeable_net_total.max(1) as f64) * 100.0,
+                        state.pips.len(),
+                        state.notes.len()
+                    ),
+                );
+            }
+        }
     }
 
     state.notes.push(state.guide_usage.summary());
+    emit_stage_info(reporter, "route", state.guide_usage.summary());
     Ok(DeviceRouteImage {
         pips: state.pips,
         notes: state.notes,
     })
+}
+
+fn push_route_note(
+    notes: &mut Vec<String>,
+    reporter: &mut Option<&mut dyn StageReporter>,
+    note: String,
+) {
+    if is_route_warning_note(&note) {
+        emit_stage_warning(reporter, "route", note.clone());
+    } else {
+        emit_stage_info(reporter, "route", note.clone());
+    }
+    notes.push(note);
+}
+
+fn is_route_warning_note(note: &str) -> bool {
+    let lowered = note.to_ascii_lowercase();
+    lowered.contains("could not find a rust route")
+        || lowered.contains("has no routed driver")
+        || lowered.contains("not a routable cell")
+        || lowered.contains("has no route-source mapping")
+        || lowered.contains("has no route-sink mapping")
 }
 
 fn load_route_resources(
@@ -152,14 +243,21 @@ fn route_net(
     index: &DeviceDesignIndex,
     net_index: usize,
     state: &mut RoutingState,
+    reporter: &mut Option<&mut dyn StageReporter>,
 ) {
-    let Some(mut prepared) = prepare_route_net(context, device, index, net_index, &mut state.notes)
-    else {
+    let Some(mut prepared) = prepare_route_net(
+        context,
+        device,
+        index,
+        net_index,
+        &mut state.notes,
+        reporter,
+    ) else {
         return;
     };
 
     for sink in ordered_net_sinks(prepared.net, prepared.driver_cell) {
-        route_net_sink(context, device, index, &mut prepared, sink, state);
+        route_net_sink(context, device, index, &mut prepared, sink, state, reporter);
     }
 }
 
@@ -169,6 +267,7 @@ fn prepare_route_net<'a>(
     index: &DeviceDesignIndex<'a>,
     net_index: usize,
     notes: &mut Vec<String>,
+    reporter: &mut Option<&mut dyn StageReporter>,
 ) -> Option<PreparedRouteNet<'a>> {
     let net = &device.nets[net_index];
     if !should_route_device_net(net) {
@@ -176,34 +275,50 @@ fn prepare_route_net<'a>(
     }
 
     let Some(driver) = net.driver.as_ref() else {
-        notes.push(format!("Net {} has no routed driver.", net.name));
+        push_route_note(
+            notes,
+            reporter,
+            format!("Net {} has no routed driver.", net.name),
+        );
         return None;
     };
 
     let driver_cell = match resolve_route_endpoint(device, index, driver) {
         ResolvedRouteEndpoint::Cell(cell) => cell,
         ResolvedRouteEndpoint::Port(port) => {
-            notes.push(format!(
-                "Net {} driver {} resolves to device port {} and is not a routable cell.",
-                net.name, driver.name, port.port_name
-            ));
+            push_route_note(
+                notes,
+                reporter,
+                format!(
+                    "Net {} driver {} resolves to device port {} and is not a routable cell.",
+                    net.name, driver.name, port.port_name
+                ),
+            );
             return None;
         }
         ResolvedRouteEndpoint::Unknown => {
-            notes.push(format!(
-                "Net {} driver {} is not a routable cell.",
-                net.name, driver.name
-            ));
+            push_route_note(
+                notes,
+                reporter,
+                format!(
+                    "Net {} driver {} is not a routable cell.",
+                    net.name, driver.name
+                ),
+            );
             return None;
         }
     };
 
     let source_nets = endpoint_source_nets(driver_cell, driver, context.wires);
     if source_nets.is_empty() {
-        notes.push(format!(
-            "Net {} driver {}:{} has no route-source mapping.",
-            net.name, driver.name, driver.pin
-        ));
+        push_route_note(
+            notes,
+            reporter,
+            format!(
+                "Net {} driver {}:{} has no route-source mapping.",
+                net.name, driver.name, driver.pin
+            ),
+        );
         return None;
     }
 
@@ -261,21 +376,30 @@ fn route_net_sink(
     prepared: &mut PreparedRouteNet<'_>,
     sink: &DeviceEndpoint,
     state: &mut RoutingState,
+    reporter: &mut Option<&mut dyn StageReporter>,
 ) {
     let sink_cell = match resolve_route_endpoint(device, index, sink) {
         ResolvedRouteEndpoint::Cell(cell) => cell,
         ResolvedRouteEndpoint::Port(port) => {
-            state.notes.push(format!(
-                "Net {} sink {} resolves to device port {} and is not a routable cell.",
-                prepared.net.name, sink.name, port.port_name
-            ));
+            push_route_note(
+                &mut state.notes,
+                reporter,
+                format!(
+                    "Net {} sink {} resolves to device port {} and is not a routable cell.",
+                    prepared.net.name, sink.name, port.port_name
+                ),
+            );
             return;
         }
         ResolvedRouteEndpoint::Unknown => {
-            state.notes.push(format!(
-                "Net {} sink {} is not a routable cell.",
-                prepared.net.name, sink.name
-            ));
+            push_route_note(
+                &mut state.notes,
+                reporter,
+                format!(
+                    "Net {} sink {} is not a routable cell.",
+                    prepared.net.name, sink.name
+                ),
+            );
             return;
         }
     };
@@ -285,10 +409,14 @@ fn route_net_sink(
         if should_skip_unmapped_sink(Some(prepared.driver_cell), sink_cell, sink) {
             return;
         }
-        state.notes.push(format!(
-            "Net {} sink {}:{} has no route-sink mapping.",
-            prepared.net.name, sink.name, sink.pin
-        ));
+        push_route_note(
+            &mut state.notes,
+            reporter,
+            format!(
+                "Net {} sink {}:{} has no route-sink mapping.",
+                prepared.net.name, sink.name, sink.pin
+            ),
+        );
         return;
     }
 
@@ -325,10 +453,18 @@ fn route_net_sink(
             &mut state.guided_search,
             &spec,
         ) else {
-            state.notes.push(format!(
-                "Net {} could not find a Rust route from {}:{} to {}:{}.",
-                prepared.net.name, prepared.driver.name, prepared.driver.pin, sink.name, sink.pin
-            ));
+            push_route_note(
+                &mut state.notes,
+                reporter,
+                format!(
+                    "Net {} could not find a Rust route from {}:{} to {}:{}.",
+                    prepared.net.name,
+                    prepared.driver.name,
+                    prepared.driver.pin,
+                    sink.name,
+                    sink.pin
+                ),
+            );
             continue;
         };
         commit_routed_path(context, prepared, state, guide_mode, path);

@@ -4,7 +4,7 @@ use crate::{
         SharedConstraints, apply_constraints, ensure_cluster_positions, ensure_port_positions,
     },
     ir::{Design, RoutePip, RouteSegment},
-    report::{StageOutput, StageReport},
+    report::{StageOutput, StageReport, StageReporter, emit_stage_info},
     resource::{Arch, SharedArch},
 };
 use anyhow::{Result, bail};
@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
 };
 
-use super::{DeviceRouteImage, route_device_design};
+use super::{DeviceRouteImage, route_device_design, route_device_design_with_reporter};
 
 #[derive(Debug, Clone)]
 pub struct RouteStageArtifacts {
@@ -32,7 +32,19 @@ pub struct RouteOptions {
 }
 
 pub fn run(design: Design, options: &RouteOptions) -> Result<StageOutput<Design>> {
-    let result = run_with_artifacts(design, options)?;
+    let result = run_with_artifacts_internal(design, options, None)?;
+    Ok(StageOutput {
+        value: result.value.design,
+        report: result.report,
+    })
+}
+
+pub fn run_with_reporter(
+    design: Design,
+    options: &RouteOptions,
+    reporter: &mut dyn StageReporter,
+) -> Result<StageOutput<Design>> {
+    let result = run_with_artifacts_internal(design, options, Some(reporter))?;
     Ok(StageOutput {
         value: result.value.design,
         report: result.report,
@@ -40,8 +52,24 @@ pub fn run(design: Design, options: &RouteOptions) -> Result<StageOutput<Design>
 }
 
 pub fn run_with_artifacts(
+    design: Design,
+    options: &RouteOptions,
+) -> Result<StageOutput<RouteStageArtifacts>> {
+    run_with_artifacts_internal(design, options, None)
+}
+
+pub fn run_with_artifacts_and_reporter(
+    design: Design,
+    options: &RouteOptions,
+    reporter: &mut dyn StageReporter,
+) -> Result<StageOutput<RouteStageArtifacts>> {
+    run_with_artifacts_internal(design, options, Some(reporter))
+}
+
+fn run_with_artifacts_internal(
     mut design: Design,
     options: &RouteOptions,
+    mut reporter: Option<&mut dyn StageReporter>,
 ) -> Result<StageOutput<RouteStageArtifacts>> {
     let Some(cil) = options.cil.as_ref() else {
         bail!(
@@ -50,6 +78,14 @@ pub fn run_with_artifacts(
     };
 
     design.stage = "routed".to_string();
+    emit_stage_info(
+        &mut reporter,
+        "route",
+        format!(
+            "preparing route stage for {} logical nets",
+            design.nets.len()
+        ),
+    );
     apply_constraints(&mut design, &options.arch, &options.constraints);
     ensure_port_positions(&mut design, &options.arch);
     if !design.clusters.is_empty() {
@@ -59,7 +95,25 @@ pub fn run_with_artifacts(
     let Some(device_design) = options.device_design.clone() else {
         bail!("route stage requires a prepared device design")
     };
-    let route_image = route_device_design(&device_design, &options.arch, &options.arch_path, cil)?;
+    emit_stage_info(
+        &mut reporter,
+        "route",
+        format!(
+            "routing {} device nets on architecture '{}'",
+            device_design.nets.len(),
+            options.arch.name
+        ),
+    );
+    let route_image = match reporter.as_deref_mut() {
+        Some(reporter) => route_device_design_with_reporter(
+            &device_design,
+            &options.arch,
+            &options.arch_path,
+            cil,
+            reporter,
+        )?,
+        None => route_device_design(&device_design, &options.arch, &options.arch_path, cil)?,
+    };
     let programmed_sites = route_image
         .pips
         .iter()
@@ -68,6 +122,15 @@ pub fn run_with_artifacts(
         .len();
     let device_net_count = device_design.nets.len();
     apply_route_image(&mut design, &route_image, &options.arch);
+    emit_stage_info(
+        &mut reporter,
+        "route",
+        format!(
+            "route stage materialized {} physical pips across {} sites",
+            route_image.pips.len(),
+            programmed_sites
+        ),
+    );
 
     let mut report = StageReport::new("route");
     report.metric("physical_pip_count", route_image.pips.len());

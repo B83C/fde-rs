@@ -119,7 +119,25 @@ pub(crate) fn write_summary(path: &Path, report: &ImplementationReport) -> Resul
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-pub(crate) fn write_log(path: &Path, report: &ImplementationReport) -> Result<()> {
-    fs::write(path, render_detailed_log(report))
+pub(crate) fn write_log_with_runtime(
+    path: &Path,
+    report: &ImplementationReport,
+    runtime_log: &str,
+) -> Result<()> {
+    fs::write(path, render_log_with_runtime(report, runtime_log))
         .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn render_log_with_runtime(report: &ImplementationReport, runtime_log: &str) -> String {
+    if runtime_log.trim().is_empty() {
+        return render_detailed_log(report);
+    }
+
+    let mut out = String::new();
+    out.push_str("FDE Runtime Log\n");
+    out.push_str("===============\n");
+    out.push_str(runtime_log.trim_end());
+    out.push_str("\n\n");
+    out.push_str(&render_detailed_log(report));
+    out
 }

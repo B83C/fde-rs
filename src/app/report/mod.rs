@@ -5,6 +5,156 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 pub type ReportMetrics = BTreeMap<String, Value>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageLogLevel {
+    Info,
+    Warning,
+    Progress,
+}
+
+impl StageLogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Progress => "progress",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageEvent {
+    Started {
+        stage: &'static str,
+    },
+    Log {
+        stage: &'static str,
+        level: StageLogLevel,
+        message: String,
+    },
+    Finished {
+        stage: &'static str,
+        status: ReportStatus,
+        elapsed_ms: u64,
+    },
+}
+
+pub trait StageReporter {
+    fn on_stage_event(&mut self, event: StageEvent);
+}
+
+impl<F> StageReporter for F
+where
+    F: FnMut(StageEvent),
+{
+    fn on_stage_event(&mut self, event: StageEvent) {
+        self(event);
+    }
+}
+
+pub struct LineStageReporter<'a> {
+    logger: &'a mut dyn FnMut(String),
+    include_lifecycle: bool,
+    include_stage_prefix: bool,
+}
+
+impl<'a> LineStageReporter<'a> {
+    pub fn runtime_only(logger: &'a mut dyn FnMut(String)) -> Self {
+        Self {
+            logger,
+            include_lifecycle: false,
+            include_stage_prefix: false,
+        }
+    }
+
+    pub fn with_lifecycle(logger: &'a mut dyn FnMut(String)) -> Self {
+        Self {
+            logger,
+            include_lifecycle: true,
+            include_stage_prefix: false,
+        }
+    }
+
+    pub fn cli(logger: &'a mut dyn FnMut(String)) -> Self {
+        Self {
+            logger,
+            include_lifecycle: true,
+            include_stage_prefix: true,
+        }
+    }
+}
+
+impl StageReporter for LineStageReporter<'_> {
+    fn on_stage_event(&mut self, event: StageEvent) {
+        let Some(line) =
+            format_stage_event_line(&event, self.include_lifecycle, self.include_stage_prefix)
+        else {
+            return;
+        };
+        (self.logger)(line);
+    }
+}
+
+pub fn emit_stage_started(reporter: &mut Option<&mut dyn StageReporter>, stage: &'static str) {
+    if let Some(reporter) = reporter.as_deref_mut() {
+        reporter.on_stage_event(StageEvent::Started { stage });
+    }
+}
+
+pub fn emit_stage_finished(
+    reporter: &mut Option<&mut dyn StageReporter>,
+    stage: &'static str,
+    status: ReportStatus,
+    elapsed: Duration,
+) {
+    if let Some(reporter) = reporter.as_deref_mut() {
+        reporter.on_stage_event(StageEvent::Finished {
+            stage,
+            status,
+            elapsed_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+        });
+    }
+}
+
+pub fn emit_stage_info(
+    reporter: &mut Option<&mut dyn StageReporter>,
+    stage: &'static str,
+    message: impl Into<String>,
+) {
+    emit_stage_event(reporter, stage, StageLogLevel::Info, message);
+}
+
+pub fn emit_stage_warning(
+    reporter: &mut Option<&mut dyn StageReporter>,
+    stage: &'static str,
+    message: impl Into<String>,
+) {
+    emit_stage_event(reporter, stage, StageLogLevel::Warning, message);
+}
+
+pub fn emit_stage_progress(
+    reporter: &mut Option<&mut dyn StageReporter>,
+    stage: &'static str,
+    message: impl Into<String>,
+) {
+    emit_stage_event(reporter, stage, StageLogLevel::Progress, message);
+}
+
+fn emit_stage_event(
+    reporter: &mut Option<&mut dyn StageReporter>,
+    stage: &'static str,
+    level: StageLogLevel,
+    message: impl Into<String>,
+) {
+    if let Some(reporter) = reporter.as_deref_mut() {
+        reporter.on_stage_event(StageEvent::Log {
+            stage,
+            level,
+            message: message.into(),
+        });
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ReportStatus {
@@ -75,6 +225,37 @@ pub struct StageOutput<T> {
     pub report: StageReport,
 }
 
+pub fn run_stage_with_reporter<T, E, Run, RunWithReporter>(
+    stage: &'static str,
+    reporter: &mut Option<&mut dyn StageReporter>,
+    run: Run,
+    run_with_reporter: RunWithReporter,
+) -> Result<StageOutput<T>, E>
+where
+    Run: FnOnce() -> Result<StageOutput<T>, E>,
+    RunWithReporter: FnOnce(&mut dyn StageReporter) -> Result<StageOutput<T>, E>,
+{
+    let started_at = std::time::Instant::now();
+    emit_stage_started(reporter, stage);
+    let result = match reporter.as_deref_mut() {
+        Some(reporter) => run_with_reporter(reporter),
+        None => run(),
+    };
+    let elapsed = started_at.elapsed();
+
+    match result {
+        Ok(mut output) => {
+            output.report.set_elapsed(elapsed);
+            emit_stage_finished(reporter, stage, output.report.status, elapsed);
+            Ok(output)
+        }
+        Err(err) => {
+            emit_stage_finished(reporter, stage, ReportStatus::Failed, elapsed);
+            Err(err)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ImplementationReport {
     pub schema_version: u32,
@@ -127,6 +308,51 @@ pub fn print_stage_report(report: &StageReport) {
     }
     for message in &report.messages {
         println!("[{}] {}", report.stage, message);
+    }
+}
+
+pub fn format_stage_event_line(
+    event: &StageEvent,
+    include_lifecycle: bool,
+    include_stage_prefix: bool,
+) -> Option<String> {
+    match event {
+        StageEvent::Started { stage } if include_lifecycle && include_stage_prefix => {
+            Some(format!("[{stage}] >>> starting {stage}\n"))
+        }
+        StageEvent::Started { stage } if include_lifecycle => {
+            Some(format!(">>> starting {stage}\n"))
+        }
+        StageEvent::Started { .. } => None,
+        StageEvent::Log {
+            stage,
+            level,
+            message,
+        } if include_stage_prefix => Some(format!("[{stage}] {}: {}\n", level.as_str(), message)),
+        StageEvent::Log { level, message, .. } => {
+            Some(format!("{}: {}\n", level.as_str(), message))
+        }
+        StageEvent::Finished {
+            stage,
+            status,
+            elapsed_ms,
+        } if include_lifecycle && include_stage_prefix => Some(format!(
+            "[{stage}] >>> completed {} ({}, {} ms)\n",
+            stage,
+            format_stage_status_name(*status),
+            elapsed_ms
+        )),
+        StageEvent::Finished {
+            stage,
+            status,
+            elapsed_ms,
+        } if include_lifecycle => Some(format!(
+            ">>> completed {} ({}, {} ms)\n",
+            stage,
+            format_stage_status_name(*status),
+            elapsed_ms
+        )),
+        StageEvent::Finished { .. } => None,
     }
 }
 
@@ -324,6 +550,14 @@ fn push_metric_line(out: &mut String, label: &str, value: Option<&Value>) {
     }
 }
 
+pub fn format_stage_status_name(status: ReportStatus) -> &'static str {
+    match status {
+        ReportStatus::Success => "success",
+        ReportStatus::Failed => "failed",
+        ReportStatus::Skipped => "skipped",
+    }
+}
+
 fn format_status(status: ReportStatus) -> &'static str {
     match status {
         ReportStatus::Success => "SUCCESS",
@@ -369,5 +603,95 @@ fn format_metric_value(value: &Value) -> String {
         },
         Value::String(value) => value.clone(),
         Value::Array(_) | Value::Object(_) => value.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_stage_event_line_omits_lifecycle_when_disabled() {
+        assert_eq!(
+            format_stage_event_line(&StageEvent::Started { stage: "route" }, false, true),
+            None
+        );
+        assert_eq!(
+            format_stage_event_line(
+                &StageEvent::Finished {
+                    stage: "route",
+                    status: ReportStatus::Success,
+                    elapsed_ms: 42,
+                },
+                false,
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn format_stage_event_line_formats_cli_progress_with_stage_prefix() {
+        assert_eq!(
+            format_stage_event_line(
+                &StageEvent::Log {
+                    stage: "route",
+                    level: StageLogLevel::Progress,
+                    message: "routed 12/34 nets".to_string(),
+                },
+                true,
+                true,
+            ),
+            Some("[route] progress: routed 12/34 nets\n".to_string())
+        );
+    }
+
+    #[test]
+    fn line_stage_reporter_runtime_only_emits_log_without_prefix_or_lifecycle() {
+        let mut lines = Vec::new();
+        let mut logger = |line: String| lines.push(line);
+        let mut reporter = LineStageReporter::runtime_only(&mut logger);
+
+        reporter.on_stage_event(StageEvent::Started { stage: "pack" });
+        reporter.on_stage_event(StageEvent::Log {
+            stage: "pack",
+            level: StageLogLevel::Info,
+            message: "clustered 16 cells".to_string(),
+        });
+        reporter.on_stage_event(StageEvent::Finished {
+            stage: "pack",
+            status: ReportStatus::Success,
+            elapsed_ms: 7,
+        });
+
+        assert_eq!(lines, vec!["info: clustered 16 cells\n".to_string()]);
+    }
+
+    #[test]
+    fn line_stage_reporter_cli_emits_lifecycle_and_prefixed_logs() {
+        let mut lines = Vec::new();
+        let mut logger = |line: String| lines.push(line);
+        let mut reporter = LineStageReporter::cli(&mut logger);
+
+        reporter.on_stage_event(StageEvent::Started { stage: "map" });
+        reporter.on_stage_event(StageEvent::Log {
+            stage: "map",
+            level: StageLogLevel::Info,
+            message: "loaded 3 cells".to_string(),
+        });
+        reporter.on_stage_event(StageEvent::Finished {
+            stage: "map",
+            status: ReportStatus::Success,
+            elapsed_ms: 5,
+        });
+
+        assert_eq!(
+            lines,
+            vec![
+                "[map] >>> starting map\n".to_string(),
+                "[map] info: loaded 3 cells\n".to_string(),
+                "[map] >>> completed map (success, 5 ms)\n".to_string(),
+            ]
+        );
     }
 }

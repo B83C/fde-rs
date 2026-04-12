@@ -9,7 +9,10 @@ use crate::{
     map::{self, MapOptions},
     pack::{self, PackOptions},
     place::{self, PlaceOptions},
-    report::ImplementationReport,
+    report::{
+        ImplementationReport, StageEvent, StageReporter, format_stage_event_line,
+        run_stage_with_reporter,
+    },
     resource::{load_arch, load_delay_model},
     route::{self, RouteOptions},
     sta::{self, StaOptions},
@@ -17,14 +20,34 @@ use crate::{
 
 use super::{
     options::ImplementationOptions,
-    report::{FlowArtifacts, ReportContext, build_report, write_log, write_report, write_summary},
+    report::{
+        FlowArtifacts, ReportContext, build_report, write_log_with_runtime, write_report,
+        write_summary,
+    },
     resources::resolve_resources,
 };
 
 pub(crate) fn run(options: &ImplementationOptions) -> Result<ImplementationReport> {
+    run_internal(options, None)
+}
+
+pub(crate) fn run_with_reporter(
+    options: &ImplementationOptions,
+    reporter: &mut dyn StageReporter,
+) -> Result<ImplementationReport> {
+    run_internal(options, Some(reporter))
+}
+
+fn run_internal(
+    options: &ImplementationOptions,
+    forward_reporter: Option<&mut dyn StageReporter>,
+) -> Result<ImplementationReport> {
     let flow_started = Instant::now();
     fs::create_dir_all(&options.out_dir)
         .with_context(|| format!("failed to create {}", options.out_dir.display()))?;
+
+    let mut runtime_reporter = RuntimeLogReporter::new(forward_reporter);
+    let mut runtime_reporter_option = Some(&mut runtime_reporter as &mut dyn StageReporter);
 
     let resources = resolve_resources(options)?;
     let inputs = report_inputs(options);
@@ -43,46 +66,95 @@ pub(crate) fn run(options: &ImplementationOptions) -> Result<ImplementationRepor
     let artifacts = FlowArtifacts::modern(&options.out_dir, options.emit_sidecar);
 
     let input_design = map::load_input(&options.input)?;
-    let map_started = Instant::now();
-    let mut map_result = map::run(
-        input_design,
-        &MapOptions {
-            lut_size: options.lut_size,
-            cell_library: resources.dc_cell.clone(),
-            emit_structural_verilog: false,
+    let mut map_result = run_stage_with_reporter(
+        "map",
+        &mut runtime_reporter_option,
+        || {
+            map::run(
+                input_design.clone(),
+                &MapOptions {
+                    lut_size: options.lut_size,
+                    cell_library: resources.dc_cell.clone(),
+                    emit_structural_verilog: false,
+                },
+            )
+        },
+        |reporter| {
+            map::run_with_reporter(
+                input_design.clone(),
+                &MapOptions {
+                    lut_size: options.lut_size,
+                    cell_library: resources.dc_cell.clone(),
+                    emit_structural_verilog: false,
+                },
+                reporter,
+            )
         },
     )?;
-    map_result.report.set_elapsed(map_started.elapsed());
     save_design(&map_result.value.design, &artifacts.map)?;
     map_result.report.artifact("design", &artifacts.map);
 
-    let pack_started = Instant::now();
-    let mut pack_result = pack::run(
-        map_result.value.design,
-        &PackOptions {
-            family: options.family.clone(),
-            capacity: options.pack_capacity,
-            cell_library: resources.pack_cell.clone(),
-            dcp_library: resources.pack_lib.clone(),
-            config: resources.pack_config.clone(),
+    let mut pack_result = run_stage_with_reporter(
+        "pack",
+        &mut runtime_reporter_option,
+        || {
+            pack::run(
+                map_result.value.design.clone(),
+                &PackOptions {
+                    family: options.family.clone(),
+                    capacity: options.pack_capacity,
+                    cell_library: resources.pack_cell.clone(),
+                    dcp_library: resources.pack_lib.clone(),
+                    config: resources.pack_config.clone(),
+                },
+            )
+        },
+        |reporter| {
+            pack::run_with_reporter(
+                map_result.value.design.clone(),
+                &PackOptions {
+                    family: options.family.clone(),
+                    capacity: options.pack_capacity,
+                    cell_library: resources.pack_cell.clone(),
+                    dcp_library: resources.pack_lib.clone(),
+                    config: resources.pack_config.clone(),
+                },
+                reporter,
+            )
         },
     )?;
-    pack_result.report.set_elapsed(pack_started.elapsed());
     save_design(&pack_result.value, &artifacts.pack)?;
     pack_result.report.artifact("design", &artifacts.pack);
 
-    let place_started = Instant::now();
-    let mut place_result = place::run(
-        pack_result.value,
-        &PlaceOptions {
-            arch: Arc::clone(&arch),
-            delay: delay_model.clone(),
-            constraints: Arc::clone(&constraints),
-            mode: options.place_mode,
-            seed: options.seed,
+    let mut place_result = run_stage_with_reporter(
+        "place",
+        &mut runtime_reporter_option,
+        || {
+            place::run(
+                pack_result.value.clone(),
+                &PlaceOptions {
+                    arch: Arc::clone(&arch),
+                    delay: delay_model.clone(),
+                    constraints: Arc::clone(&constraints),
+                    mode: options.place_mode,
+                    seed: options.seed,
+                },
+            )
+        },
+        |reporter| {
+            place::run_with_reporter(
+                pack_result.value.clone(),
+                &PlaceOptions {
+                    arch: Arc::clone(&arch),
+                    delay: delay_model.clone(),
+                    constraints: Arc::clone(&constraints),
+                    mode: options.place_mode,
+                    seed: options.seed,
+                },
+                reporter,
+            )
         },
     )?;
-    place_result.report.set_elapsed(place_started.elapsed());
     save_design_with_context(
         &place_result.value,
         &artifacts.place,
@@ -105,18 +177,35 @@ pub(crate) fn run(options: &ImplementationOptions) -> Result<ImplementationRepor
             )
         })
         .transpose()?;
-    let route_started = Instant::now();
-    let mut route_result = route::run_with_artifacts(
-        place_result.value,
-        &RouteOptions {
-            arch: Arc::clone(&arch),
-            arch_path: resources.arch.clone(),
-            constraints: Arc::clone(&constraints),
-            cil: loaded_cil.clone(),
-            device_design: route_device_design,
+    let mut route_result = run_stage_with_reporter(
+        "route",
+        &mut runtime_reporter_option,
+        || {
+            route::run_with_artifacts(
+                place_result.value.clone(),
+                &RouteOptions {
+                    arch: Arc::clone(&arch),
+                    arch_path: resources.arch.clone(),
+                    constraints: Arc::clone(&constraints),
+                    cil: loaded_cil.clone(),
+                    device_design: route_device_design.clone(),
+                },
+            )
+        },
+        |reporter| {
+            route::run_with_artifacts_and_reporter(
+                place_result.value.clone(),
+                &RouteOptions {
+                    arch: Arc::clone(&arch),
+                    arch_path: resources.arch.clone(),
+                    constraints: Arc::clone(&constraints),
+                    cil: loaded_cil.clone(),
+                    device_design: route_device_design.clone(),
+                },
+                reporter,
+            )
         },
     )?;
-    route_result.report.set_elapsed(route_started.elapsed());
     route_result.report.artifact("design", &artifacts.route);
     if let Some(device_path) = artifacts.device.as_ref() {
         route_result.report.artifact("device_design", device_path);
@@ -141,15 +230,29 @@ pub(crate) fn run(options: &ImplementationOptions) -> Result<ImplementationRepor
             .with_context(|| format!("failed to write {}", device_path.display()))?;
     }
 
-    let sta_started = Instant::now();
-    let mut sta_result = sta::run(
-        routed_design,
-        &StaOptions {
-            arch: Some(Arc::clone(&arch)),
-            delay: delay_model.clone(),
+    let mut sta_result = run_stage_with_reporter(
+        "sta",
+        &mut runtime_reporter_option,
+        || {
+            sta::run(
+                routed_design.clone(),
+                &StaOptions {
+                    arch: Some(Arc::clone(&arch)),
+                    delay: delay_model.clone(),
+                },
+            )
+        },
+        |reporter| {
+            sta::run_with_reporter(
+                routed_design.clone(),
+                &StaOptions {
+                    arch: Some(Arc::clone(&arch)),
+                    delay: delay_model.clone(),
+                },
+                reporter,
+            )
         },
     )?;
-    sta_result.report.set_elapsed(sta_started.elapsed());
     if let Some(sta_lib) = resources.sta_lib.as_ref() {
         sta_result
             .report
@@ -170,19 +273,37 @@ pub(crate) fn run(options: &ImplementationOptions) -> Result<ImplementationRepor
         .report
         .artifact("timing_report", &artifacts.sta_report);
 
-    let bitgen_started = Instant::now();
-    let mut bitgen_result = bitgen::run(
-        sta_result.value.design.clone(),
-        &BitgenOptions {
-            arch_name: Some(arch.name.clone()),
-            arch_path: Some(resources.arch.clone()),
-            cil_path: resources.cil.clone(),
-            cil: loaded_cil,
-            device_design: Some(device_design),
-            route_image: Some(route_image),
+    let mut bitgen_result = run_stage_with_reporter(
+        "bitgen",
+        &mut runtime_reporter_option,
+        || {
+            bitgen::run(
+                sta_result.value.design.clone(),
+                &BitgenOptions {
+                    arch_name: Some(arch.name.clone()),
+                    arch_path: Some(resources.arch.clone()),
+                    cil_path: resources.cil.clone(),
+                    cil: loaded_cil.clone(),
+                    device_design: Some(device_design.clone()),
+                    route_image: Some(route_image.clone()),
+                },
+            )
+        },
+        |reporter| {
+            bitgen::run_with_reporter(
+                sta_result.value.design.clone(),
+                &BitgenOptions {
+                    arch_name: Some(arch.name.clone()),
+                    arch_path: Some(resources.arch.clone()),
+                    cil_path: resources.cil.clone(),
+                    cil: loaded_cil.clone(),
+                    device_design: Some(device_design.clone()),
+                    route_image: Some(route_image.clone()),
+                },
+                reporter,
+            )
         },
     )?;
-    bitgen_result.report.set_elapsed(bitgen_started.elapsed());
     fs::write(&artifacts.bitstream, &bitgen_result.value.bytes)
         .with_context(|| format!("failed to write {}", artifacts.bitstream.display()))?;
     bitgen_result
@@ -227,8 +348,37 @@ pub(crate) fn run(options: &ImplementationOptions) -> Result<ImplementationRepor
     );
     write_report(&artifacts.report, &report)?;
     write_summary(&artifacts.summary, &report)?;
-    write_log(&artifacts.log, &report)?;
+    write_log_with_runtime(&artifacts.log, &report, runtime_reporter.runtime_log())?;
     Ok(report)
+}
+
+struct RuntimeLogReporter<'a> {
+    runtime_log: String,
+    forward: Option<&'a mut dyn StageReporter>,
+}
+
+impl<'a> RuntimeLogReporter<'a> {
+    fn new(forward: Option<&'a mut dyn StageReporter>) -> Self {
+        Self {
+            runtime_log: String::new(),
+            forward,
+        }
+    }
+
+    fn runtime_log(&self) -> &str {
+        self.runtime_log.as_str()
+    }
+}
+
+impl StageReporter for RuntimeLogReporter<'_> {
+    fn on_stage_event(&mut self, event: StageEvent) {
+        if let Some(line) = format_stage_event_line(&event, true, true) {
+            self.runtime_log.push_str(&line);
+        }
+        if let Some(forward) = self.forward.as_deref_mut() {
+            forward.on_stage_event(event);
+        }
+    }
 }
 
 fn report_inputs(options: &ImplementationOptions) -> BTreeMap<String, String> {

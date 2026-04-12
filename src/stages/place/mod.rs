@@ -9,7 +9,7 @@ use crate::{
     constraints::{apply_constraints, ensure_port_positions},
     domain::ClusterKind,
     ir::Design,
-    report::{StageOutput, StageReport},
+    report::{StageOutput, StageReport, StageReporter, emit_stage_info},
     resource::{Arch, SharedArch, SharedDelayModel},
 };
 use anyhow::{Result, anyhow, bail};
@@ -38,18 +38,47 @@ pub struct PlaceOptions {
     pub seed: u64,
 }
 
-pub fn run(mut design: Design, options: &PlaceOptions) -> Result<StageOutput<Design>> {
+pub fn run(design: Design, options: &PlaceOptions) -> Result<StageOutput<Design>> {
+    run_internal(design, options, None)
+}
+
+pub fn run_with_reporter(
+    design: Design,
+    options: &PlaceOptions,
+    reporter: &mut dyn StageReporter,
+) -> Result<StageOutput<Design>> {
+    run_internal(design, options, Some(reporter))
+}
+
+fn run_internal(
+    mut design: Design,
+    options: &PlaceOptions,
+    mut reporter: Option<&mut dyn StageReporter>,
+) -> Result<StageOutput<Design>> {
     if matches!(options.mode, PlaceMode::TimingDriven) && options.delay.is_none() {
         bail!("timing-driven placement requires an explicit delay model");
     }
 
     design.stage = "placed".to_string();
     design.metadata.arch_name = options.arch.name.clone();
+    emit_stage_info(
+        &mut reporter,
+        "place",
+        format!(
+            "preparing placement on {}x{} grid (mode={:?}, seed={})",
+            options.arch.width, options.arch.height, options.mode, options.seed
+        ),
+    );
     apply_constraints(&mut design, &options.arch, &options.constraints);
     ensure_port_positions(&mut design, &options.arch);
 
     if matches!(options.mode, PlaceMode::TimingDriven) {
         annotate_net_criticality(&mut design);
+        emit_stage_info(
+            &mut reporter,
+            "place",
+            "annotated net criticality for timing-driven placement",
+        );
     }
 
     if design.clusters.is_empty() {
@@ -62,6 +91,19 @@ pub fn run(mut design: Design, options: &PlaceOptions) -> Result<StageOutput<Des
     }
 
     let block_ram_cluster_count = assign_block_ram_clusters(&mut design, &options.arch)?;
+    emit_stage_info(
+        &mut reporter,
+        "place",
+        format!(
+            "placement design has {} clusters ({} block RAM, {} logic)",
+            design.clusters.len(),
+            block_ram_cluster_count,
+            design
+                .clusters
+                .len()
+                .saturating_sub(block_ram_cluster_count)
+        ),
+    );
     let sites = options.arch.logic_sites();
     let site_capacity = options.arch.slices_per_tile.max(1);
     let logic_cluster_count = design
@@ -77,7 +119,10 @@ pub fn run(mut design: Design, options: &PlaceOptions) -> Result<StageOutput<Des
         );
     }
 
-    let solution = solver::solve(&design, options)?;
+    let solution = match reporter.as_deref_mut() {
+        Some(reporter) => solver::solve_with_reporter(&design, options, reporter)?,
+        None => solver::solve(&design, options)?,
+    };
     for (cluster, point) in design.clusters.iter_mut().zip(&solution.placements) {
         if let Some(point) = point {
             cluster.x = Some(point.x);
@@ -85,6 +130,14 @@ pub fn run(mut design: Design, options: &PlaceOptions) -> Result<StageOutput<Des
         }
     }
     assign_cluster_slots(&mut design, site_capacity)?;
+    emit_stage_info(
+        &mut reporter,
+        "place",
+        format!(
+            "placement complete with total cost {:.3} and site capacity {}",
+            solution.metrics.total, site_capacity
+        ),
+    );
 
     let mut report = StageReport::new("place");
     report.metric("cluster_count", design.clusters.len());

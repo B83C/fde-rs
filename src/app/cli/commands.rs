@@ -11,7 +11,7 @@ use crate::{
     orchestrator,
     pack::{self, PackOptions},
     place::{self, PlaceOptions},
-    report::print_stage_report,
+    report::{LineStageReporter, print_stage_report, run_stage_with_reporter},
     resource::{load_arch, load_delay_model},
     route::{self, RouteOptions},
     sta::{self, StaOptions},
@@ -41,14 +41,24 @@ pub(crate) fn dispatch_command(command: Command) -> Result<()> {
 
 pub(crate) fn run_map(args: MapArgs, emit_report: bool) -> Result<()> {
     let design = map::load_input(&args.input)?;
-    let result = map::run(
-        design,
-        &MapOptions {
-            lut_size: args.lut_size,
-            cell_library: args.cell_library.clone(),
-            emit_structural_verilog: args.verilog_output.is_some(),
-        },
-    )?;
+    let options = MapOptions {
+        lut_size: args.lut_size,
+        cell_library: args.cell_library.clone(),
+        emit_structural_verilog: args.verilog_output.is_some(),
+    };
+    let result = if emit_report {
+        let mut stdout_logger = |line: String| print!("{line}");
+        let mut cli_reporter = LineStageReporter::cli(&mut stdout_logger);
+        let mut reporter = Some(&mut cli_reporter as &mut dyn crate::report::StageReporter);
+        run_stage_with_reporter(
+            "map",
+            &mut reporter,
+            || map::run(design.clone(), &options),
+            |reporter| map::run_with_reporter(design.clone(), &options, reporter),
+        )?
+    } else {
+        map::run(design, &options)?
+    };
     save_design(&result.value.design, &args.output)?;
     if let Some(path) = args.verilog_output
         && let Some(verilog) = result.value.structural_verilog
@@ -63,16 +73,26 @@ pub(crate) fn run_map(args: MapArgs, emit_report: bool) -> Result<()> {
 
 pub(crate) fn run_pack(args: PackArgs, emit_report: bool) -> Result<()> {
     let design = load_design(&args.input)?;
-    let result = pack::run(
-        design,
-        &PackOptions {
-            family: args.family,
-            capacity: args.capacity,
-            cell_library: args.cell_library,
-            dcp_library: args.dcp_library,
-            config: args.config,
-        },
-    )?;
+    let options = PackOptions {
+        family: args.family,
+        capacity: args.capacity,
+        cell_library: args.cell_library,
+        dcp_library: args.dcp_library,
+        config: args.config,
+    };
+    let result = if emit_report {
+        let mut stdout_logger = |line: String| print!("{line}");
+        let mut cli_reporter = LineStageReporter::cli(&mut stdout_logger);
+        let mut reporter = Some(&mut cli_reporter as &mut dyn crate::report::StageReporter);
+        run_stage_with_reporter(
+            "pack",
+            &mut reporter,
+            || pack::run(design.clone(), &options),
+            |reporter| pack::run_with_reporter(design.clone(), &options, reporter),
+        )?
+    } else {
+        pack::run(design, &options)?
+    };
     save_design(&result.value, &args.output)?;
     if emit_report {
         print_stage_report(&result.report);
@@ -85,16 +105,26 @@ pub(crate) fn run_place(args: PlaceArgs, emit_report: bool) -> Result<()> {
     let arch = Arc::new(load_arch(&args.arch)?);
     let delay = load_delay_model(args.delay.as_deref())?;
     let constraints = load_constraints_or_empty(args.constraints.as_ref())?;
-    let result = place::run(
-        design,
-        &PlaceOptions {
-            arch: Arc::clone(&arch),
-            delay: delay.map(Arc::new),
-            constraints: Arc::clone(&constraints),
-            mode: args.mode.into(),
-            seed: args.seed,
-        },
-    )?;
+    let options = PlaceOptions {
+        arch: Arc::clone(&arch),
+        delay: delay.map(Arc::new),
+        constraints: Arc::clone(&constraints),
+        mode: args.mode.into(),
+        seed: args.seed,
+    };
+    let result = if emit_report {
+        let mut stdout_logger = |line: String| print!("{line}");
+        let mut cli_reporter = LineStageReporter::cli(&mut stdout_logger);
+        let mut reporter = Some(&mut cli_reporter as &mut dyn crate::report::StageReporter);
+        run_stage_with_reporter(
+            "place",
+            &mut reporter,
+            || place::run(design.clone(), &options),
+            |reporter| place::run_with_reporter(design.clone(), &options, reporter),
+        )?
+    } else {
+        place::run(design, &options)?
+    };
     save_design_with_context(
         &result.value,
         &args.output,
@@ -129,16 +159,26 @@ pub(crate) fn run_route(args: RouteArgs, emit_report: bool) -> Result<()> {
             )
         })
         .transpose()?;
-    let result = route::run(
-        design,
-        &RouteOptions {
-            arch: Arc::clone(&arch),
-            arch_path: args.arch.clone(),
-            constraints: Arc::clone(&constraints),
-            cil: cil.clone(),
-            device_design,
-        },
-    )?;
+    let options = RouteOptions {
+        arch: Arc::clone(&arch),
+        arch_path: args.arch.clone(),
+        constraints: Arc::clone(&constraints),
+        cil: cil.clone(),
+        device_design,
+    };
+    let result = if emit_report {
+        let mut stdout_logger = |line: String| print!("{line}");
+        let mut cli_reporter = LineStageReporter::cli(&mut stdout_logger);
+        let mut reporter = Some(&mut cli_reporter as &mut dyn crate::report::StageReporter);
+        run_stage_with_reporter(
+            "route",
+            &mut reporter,
+            || route::run(design.clone(), &options),
+            |reporter| route::run_with_reporter(design.clone(), &options, reporter),
+        )?
+    } else {
+        route::run(design, &options)?
+    };
     save_design_with_context(
         &result.value,
         &args.output,
@@ -162,13 +202,23 @@ pub(crate) fn run_sta(args: StaArgs, emit_report: bool) -> Result<()> {
         None => None,
     };
     let delay = load_delay_model(args.delay.as_deref())?;
-    let mut result = sta::run(
-        design,
-        &StaOptions {
-            arch: arch.clone().map(Arc::new),
-            delay: delay.map(Arc::new),
-        },
-    )?;
+    let options = StaOptions {
+        arch: arch.clone().map(Arc::new),
+        delay: delay.map(Arc::new),
+    };
+    let mut result = if emit_report {
+        let mut stdout_logger = |line: String| print!("{line}");
+        let mut cli_reporter = LineStageReporter::cli(&mut stdout_logger);
+        let mut reporter = Some(&mut cli_reporter as &mut dyn crate::report::StageReporter);
+        run_stage_with_reporter(
+            "sta",
+            &mut reporter,
+            || sta::run(design.clone(), &options),
+            |reporter| sta::run_with_reporter(design.clone(), &options, reporter),
+        )?
+    } else {
+        sta::run(design, &options)?
+    };
     if let Some(path) = args.timing_library.as_ref() {
         result
             .report
@@ -193,7 +243,19 @@ pub(crate) fn run_sta(args: StaArgs, emit_report: bool) -> Result<()> {
 pub(crate) fn run_bitgen(args: BitgenArgs, emit_report: bool) -> Result<()> {
     let design = load_design(&args.input)?;
     let prepared = prepare_bitgen(&design, args.arch.as_ref(), args.cil.as_ref())?;
-    let result = bitgen::run(design, &prepared.options)?;
+    let result = if emit_report {
+        let mut stdout_logger = |line: String| print!("{line}");
+        let mut cli_reporter = LineStageReporter::cli(&mut stdout_logger);
+        let mut reporter = Some(&mut cli_reporter as &mut dyn crate::report::StageReporter);
+        run_stage_with_reporter(
+            "bitgen",
+            &mut reporter,
+            || bitgen::run(design.clone(), &prepared.options),
+            |reporter| bitgen::run_with_reporter(design.clone(), &prepared.options, reporter),
+        )?
+    } else {
+        bitgen::run(design, &prepared.options)?
+    };
     fs::write(&args.output, &result.value.bytes)
         .with_context(|| format!("failed to write {}", args.output.display()))?;
     if args.emit_sidecar || args.sidecar.is_some() {
@@ -235,7 +297,9 @@ pub(crate) fn run_import(args: ImportArgs, emit_report: bool) -> Result<()> {
 }
 
 pub(crate) fn run_impl(args: ImplArgs) -> Result<()> {
-    let report = orchestrator::run(&args.into())?;
+    let mut stdout_logger = |line: String| print!("{line}");
+    let mut reporter = LineStageReporter::cli(&mut stdout_logger);
+    let report = orchestrator::run_with_reporter(&args.into(), &mut reporter)?;
     for stage in &report.stages {
         print_stage_report(stage);
     }

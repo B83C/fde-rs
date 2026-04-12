@@ -8,5 +8,5 @@ mod report;
 #[cfg(test)]
 mod tests;
 
-pub use api::{StaArtifact, StaOptions, run};
+pub use api::{StaArtifact, StaOptions, run, run_with_reporter};
 pub use error::StaError;

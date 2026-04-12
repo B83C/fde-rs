@@ -1,6 +1,7 @@
 use crate::{
     ir::ClusterId,
     place::{PlaceMode, PlaceOptions},
+    report::{StageReporter, emit_stage_info, emit_stage_progress},
 };
 use anyhow::{Result, anyhow};
 use rand::{Rng, SeedableRng};
@@ -55,12 +56,22 @@ pub(crate) fn solve(
     design: &crate::ir::Design,
     options: &PlaceOptions,
 ) -> Result<PlacementSolution> {
-    solve_internal(design, options, None)
+    let mut logger = None;
+    solve_internal(design, options, &mut logger, None)
+}
+
+pub(crate) fn solve_with_reporter(
+    design: &crate::ir::Design,
+    options: &PlaceOptions,
+    reporter: &mut dyn StageReporter,
+) -> Result<PlacementSolution> {
+    solve_internal(design, options, &mut Some(reporter), None)
 }
 
 fn solve_internal(
     design: &crate::ir::Design,
     options: &PlaceOptions,
+    reporter: &mut Option<&mut dyn StageReporter>,
     incremental_override: Option<bool>,
 ) -> Result<PlacementSolution> {
     let sites = options
@@ -125,11 +136,58 @@ fn solve_internal(
 
     let use_incremental =
         incremental_override.unwrap_or(model.nets.len() >= INCREMENTAL_EVALUATOR_NET_THRESHOLD);
+    emit_stage_info(
+        reporter,
+        "place",
+        format!(
+            "placement solver initialized: movable_clusters={}, nets={}, strategy={}",
+            movable.len(),
+            model.nets.len(),
+            if use_incremental {
+                "incremental"
+            } else {
+                "full"
+            }
+        ),
+    );
     if use_incremental {
-        solve_incremental(&context)
+        solve_incremental(&context, reporter)
     } else {
-        solve_full(&context)
+        solve_full(&context, reporter)
     }
+}
+
+fn should_log_progress(step: usize, iterations: usize) -> bool {
+    if iterations <= 20 {
+        return true;
+    }
+    let interval = (iterations / 20).max(1);
+    step == 0 || step + 1 == iterations || (step + 1).is_multiple_of(interval)
+}
+
+fn emit_anneal_progress(
+    reporter: &mut Option<&mut dyn StageReporter>,
+    strategy: &str,
+    step: usize,
+    iterations: usize,
+    temperature: f64,
+    current: &PlacementMetrics,
+    best: &PlacementMetrics,
+) {
+    emit_stage_progress(
+        reporter,
+        "place",
+        format!(
+            "{} anneal {}/{} ({:.0}%), temp={:.3}, current={:.3}, best={:.3}",
+            strategy,
+            step + 1,
+            iterations,
+            ((step + 1) as f64 / iterations.max(1) as f64) * 100.0,
+            temperature,
+            current.total,
+            best.total
+        ),
+    );
 }
 
 fn initial_positions(context: &SolveContext<'_>) -> Result<Vec<Option<Point>>> {
@@ -318,7 +376,10 @@ fn maybe_apply_incremental_swap(
     }
 }
 
-fn solve_incremental(context: &SolveContext<'_>) -> Result<PlacementSolution> {
+fn solve_incremental(
+    context: &SolveContext<'_>,
+    reporter: &mut Option<&mut dyn StageReporter>,
+) -> Result<PlacementSolution> {
     let mut rng = ChaCha8Rng::seed_from_u64(context.options.seed);
     let mut state = incremental_state(context, initial_positions(context)?);
     let mut best = PlacementSolution {
@@ -330,8 +391,27 @@ fn solve_incremental(context: &SolveContext<'_>) -> Result<PlacementSolution> {
     let iterations = anneal_iterations(context);
     let mut temperature = anneal_temperature(state.metrics.total, context.movable.len());
     let mut stall = 0usize;
+    emit_stage_info(
+        reporter,
+        "place",
+        format!(
+            "starting incremental anneal with {} iterations, initial cost {:.3}",
+            iterations, state.metrics.total
+        ),
+    );
 
     for step in 0..iterations {
+        if should_log_progress(step, iterations) {
+            emit_anneal_progress(
+                reporter,
+                "incremental",
+                step,
+                iterations,
+                temperature,
+                &state.metrics,
+                &best.metrics,
+            );
+        }
         let (focus, candidates) = choose_focus_and_targets(
             context,
             state.evaluator.placements(),
@@ -382,7 +462,20 @@ fn solve_incremental(context: &SolveContext<'_>) -> Result<PlacementSolution> {
         temperature = cool_temperature(temperature, step);
     }
 
-    Ok(refine_solution(context, best.placements, best.metrics))
+    emit_stage_info(
+        reporter,
+        "place",
+        format!(
+            "incremental anneal finished with best cost {:.3}; starting refinement",
+            best.metrics.total
+        ),
+    );
+    Ok(refine_solution(
+        context,
+        best.placements,
+        best.metrics,
+        reporter,
+    ))
 }
 
 fn best_full_trial(
@@ -457,7 +550,10 @@ fn maybe_apply_full_swap(
     }
 }
 
-fn solve_full(context: &SolveContext<'_>) -> Result<PlacementSolution> {
+fn solve_full(
+    context: &SolveContext<'_>,
+    reporter: &mut Option<&mut dyn StageReporter>,
+) -> Result<PlacementSolution> {
     let mut rng = ChaCha8Rng::seed_from_u64(context.options.seed);
     let mut state = full_state(context, initial_positions(context)?);
     let mut best = PlacementSolution {
@@ -469,8 +565,27 @@ fn solve_full(context: &SolveContext<'_>) -> Result<PlacementSolution> {
     let iterations = anneal_iterations(context);
     let mut temperature = anneal_temperature(state.metrics.total, context.movable.len());
     let mut stall = 0usize;
+    emit_stage_info(
+        reporter,
+        "place",
+        format!(
+            "starting full anneal with {} iterations, initial cost {:.3}",
+            iterations, state.metrics.total
+        ),
+    );
 
     for step in 0..iterations {
+        if should_log_progress(step, iterations) {
+            emit_anneal_progress(
+                reporter,
+                "full",
+                step,
+                iterations,
+                temperature,
+                &state.metrics,
+                &best.metrics,
+            );
+        }
         let (focus, candidates) =
             choose_focus_and_targets(context, &state.current, &focus_weights, &mut rng)?;
         let best_trial = best_full_trial(
@@ -518,13 +633,27 @@ fn solve_full(context: &SolveContext<'_>) -> Result<PlacementSolution> {
         temperature = cool_temperature(temperature, step);
     }
 
-    Ok(refine_solution(context, best.placements, best.metrics))
+    emit_stage_info(
+        reporter,
+        "place",
+        format!(
+            "full anneal finished with best cost {:.3}; starting refinement",
+            best.metrics.total
+        ),
+    );
+    Ok(refine_solution(
+        context,
+        best.placements,
+        best.metrics,
+        reporter,
+    ))
 }
 
 fn refine_solution(
     context: &SolveContext<'_>,
     placements: Vec<Option<Point>>,
     metrics: PlacementMetrics,
+    reporter: &mut Option<&mut dyn StageReporter>,
 ) -> PlacementSolution {
     let mut evaluator = PlacementEvaluator::new_from_positions(
         context.model,
@@ -548,8 +677,17 @@ fn refine_solution(
     );
     let focus_order = refinement_focus_order(context);
     let pass_limit = refinement_pass_limit(context.movable.len());
+    emit_stage_info(
+        reporter,
+        "place",
+        format!(
+            "refinement configured for up to {} pass(es) across {} focus clusters",
+            pass_limit,
+            focus_order.len()
+        ),
+    );
 
-    for _ in 0..pass_limit {
+    for pass_index in 0..pass_limit {
         let mut improved = false;
         for &focus in &focus_order {
             let candidates = refinement_targets(context, focus, evaluator.placements());
@@ -592,11 +730,30 @@ fn refine_solution(
                 improved = true;
             }
         }
+        emit_stage_progress(
+            reporter,
+            "place",
+            format!(
+                "refinement pass {}/{} -> {} (cost {:.3})",
+                pass_index + 1,
+                pass_limit,
+                if improved { "improved" } else { "stable" },
+                evaluator.metrics().total
+            ),
+        );
         if !improved {
             break;
         }
     }
 
+    emit_stage_info(
+        reporter,
+        "place",
+        format!(
+            "placement refinement complete with final cost {:.3}",
+            evaluator.metrics().total
+        ),
+    );
     PlacementSolution {
         placements: evaluator.placements().to_vec(),
         metrics: evaluator.metrics().clone(),

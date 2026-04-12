@@ -16,7 +16,7 @@ mod tests;
 
 use anyhow::Result;
 
-pub use api::{BitgenOptions, run};
+pub use api::{BitgenOptions, run, run_with_reporter};
 pub use config_image::{AppliedSiteConfig, ConfigImage, TileBitAssignment, TileConfigImage};
 pub use device::{
     DeviceCell, DeviceDesign, DeviceEndpoint, DeviceNet, DevicePort, DeviceSinkGuide,
