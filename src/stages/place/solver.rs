@@ -21,6 +21,8 @@ use super::{
 };
 
 const INCREMENTAL_EVALUATOR_NET_THRESHOLD: usize = 128;
+const CANDIDATE_SCORE_PARALLEL_THRESHOLD: usize = 16;
+const CANDIDATE_SCORE_PARALLEL_MIN_MOVABLE_CLUSTERS: usize = 1024;
 const ANNEAL_TEMPERATURE_FLOOR: f64 = 0.02;
 const PLATEAU_EARLY_EXIT_MIN_ITERATIONS: usize = 50_000;
 const PLATEAU_EARLY_EXIT_MIN_MOVABLE_CLUSTERS: usize = 512;
@@ -412,9 +414,40 @@ fn best_incremental_trial(
     focus: ClusterId,
     candidates: CandidateTargets,
 ) -> Option<PlacementCandidate> {
-    let mut best_updates: Option<ClusterUpdates> = None;
-    let mut best_total = f64::INFINITY;
     let (_, site_mask, site_capacity) = site_resources(context, focus);
+    if !should_parallel_score(context, candidates.len()) {
+        let mut best_trial: Option<(usize, ClusterUpdates, f64)> = None;
+        for (index, target) in candidates.into_iter().enumerate() {
+            let Some(changes) = plan_target_updates(
+                TargetUpdateContext {
+                    placements: evaluator.placements(),
+                    occupancy: current_occupancy,
+                    movable_mask: context.movable_mask,
+                    site_mask,
+                    width: context.options.arch.width,
+                    height: context.options.arch.height,
+                    site_capacity,
+                },
+                focus,
+                target,
+            ) else {
+                continue;
+            };
+            let metrics = evaluator.evaluate_prepared_candidate_metrics(&changes);
+            let replace = best_trial
+                .as_ref()
+                .is_none_or(|(best_index, _, best_total)| {
+                    best_metric_choice(Some((*best_index, *best_total)), (index, metrics.total)).0
+                        == index
+                });
+            if replace {
+                best_trial = Some((index, changes, metrics.total));
+            }
+        }
+        return best_trial.map(|(_, changes, _)| evaluator.evaluate_prepared_candidate(changes));
+    }
+
+    let mut planned = Vec::with_capacity(candidates.len());
     for target in candidates {
         let Some(changes) = plan_target_updates(
             TargetUpdateContext {
@@ -431,14 +464,30 @@ fn best_incremental_trial(
         ) else {
             continue;
         };
-        let metrics = evaluator.evaluate_prepared_candidate_metrics(&changes);
-        if metrics.total < best_total {
-            best_total = metrics.total;
-            best_updates = Some(changes);
-        }
+        planned.push(changes);
     }
 
-    best_updates.map(|changes| evaluator.evaluate_prepared_candidate(changes))
+    if planned.is_empty() {
+        return None;
+    }
+
+    let best_index = if planned.len() >= CANDIDATE_SCORE_PARALLEL_THRESHOLD {
+        evaluator
+            .best_candidate_metrics_parallel(&planned)
+            .map(|(index, _)| index)?
+    } else {
+        let mut best_choice: Option<(usize, f64)> = None;
+        for (index, changes) in planned.iter().enumerate() {
+            let metrics = evaluator.evaluate_prepared_candidate_metrics(changes);
+            best_choice = Some(best_metric_choice(best_choice, (index, metrics.total)));
+        }
+        best_choice.map(|(index, _)| index)?
+    };
+
+    planned
+        .get(best_index)
+        .cloned()
+        .map(|changes| evaluator.evaluate_prepared_candidate(changes))
 }
 
 fn maybe_apply_incremental_swap(
@@ -595,9 +644,9 @@ fn best_full_trial(
     focus: ClusterId,
     candidates: CandidateTargets,
 ) -> Option<(ClusterUpdates, PlacementMetrics)> {
-    let mut best_trial: Option<(ClusterUpdates, PlacementMetrics)> = None;
+    let mut best_trial: Option<(usize, ClusterUpdates, PlacementMetrics)> = None;
     let (_, site_mask, site_capacity) = site_resources(context, focus);
-    for target in candidates {
+    for (index, target) in candidates.into_iter().enumerate() {
         let Some(changes) = plan_target_updates(
             TargetUpdateContext {
                 placements: current,
@@ -623,14 +672,20 @@ fn best_full_trial(
             context.options.mode,
         );
         restore_updates(trial, &backups);
-        if best_trial
+        let replace = best_trial
             .as_ref()
-            .is_none_or(|(_, best_metrics)| metrics.total < best_metrics.total)
-        {
-            best_trial = Some((changes, metrics));
+            .is_none_or(|(best_index, _, best_metrics)| {
+                best_metric_choice(
+                    Some((*best_index, best_metrics.total)),
+                    (index, metrics.total),
+                )
+                .0 == index
+            });
+        if replace {
+            best_trial = Some((index, changes, metrics));
         }
     }
-    best_trial
+    best_trial.map(|(_, changes, metrics)| (changes, metrics))
 }
 
 fn maybe_apply_full_swap(
@@ -821,41 +876,100 @@ fn refine_solution(
         let mut improved = false;
         for &focus in &focus_order {
             let candidates = refinement_targets(context, focus, evaluator.placements());
-            let mut best_trial: Option<PlacementCandidate> = None;
             let (_, site_mask, site_capacity) = site_resources(context, focus);
-            for target in candidates {
-                let Some(changes) = plan_target_updates(
-                    TargetUpdateContext {
-                        placements: evaluator.placements(),
-                        occupancy: &occupancy,
-                        movable_mask: context.movable_mask,
-                        site_mask,
-                        width: context.options.arch.width,
-                        height: context.options.arch.height,
-                        site_capacity,
-                    },
-                    focus,
-                    target,
-                ) else {
-                    continue;
-                };
-                if changes.is_empty() {
-                    continue;
+            let best_trial = if !should_parallel_score(context, candidates.len()) {
+                let mut best_trial: Option<(usize, ClusterUpdates, f64)> = None;
+                for (index, target) in candidates.into_iter().enumerate() {
+                    let Some(changes) = plan_target_updates(
+                        TargetUpdateContext {
+                            placements: evaluator.placements(),
+                            occupancy: &occupancy,
+                            movable_mask: context.movable_mask,
+                            site_mask,
+                            width: context.options.arch.width,
+                            height: context.options.arch.height,
+                            site_capacity,
+                        },
+                        focus,
+                        target,
+                    ) else {
+                        continue;
+                    };
+                    if changes.is_empty() {
+                        continue;
+                    }
+                    let metrics = evaluator.evaluate_prepared_candidate_metrics(&changes);
+                    if metrics.total + 1e-9 >= evaluator.metrics().total {
+                        continue;
+                    }
+                    let replace = best_trial
+                        .as_ref()
+                        .is_none_or(|(best_index, _, best_total)| {
+                            best_metric_choice(
+                                Some((*best_index, *best_total)),
+                                (index, metrics.total),
+                            )
+                            .0 == index
+                        });
+                    if replace {
+                        best_trial = Some((index, changes, metrics.total));
+                    }
                 }
-                let trial_metrics = evaluator.evaluate_prepared_candidate_metrics(&changes);
-                if trial_metrics.total + 1e-9 >= evaluator.metrics().total {
-                    continue;
+                best_trial.map(|(_, changes, _)| evaluator.evaluate_prepared_candidate(changes))
+            } else {
+                let mut planned = Vec::with_capacity(candidates.len());
+                for target in candidates {
+                    let Some(changes) = plan_target_updates(
+                        TargetUpdateContext {
+                            placements: evaluator.placements(),
+                            occupancy: &occupancy,
+                            movable_mask: context.movable_mask,
+                            site_mask,
+                            width: context.options.arch.width,
+                            height: context.options.arch.height,
+                            site_capacity,
+                        },
+                        focus,
+                        target,
+                    ) else {
+                        continue;
+                    };
+                    if changes.is_empty() {
+                        continue;
+                    }
+                    planned.push(changes);
                 }
-                let trial = evaluator.evaluate_prepared_candidate(changes);
-                if best_trial
-                    .as_ref()
-                    .is_none_or(|best| trial.metrics().total + 1e-9 < best.metrics().total)
-                {
-                    best_trial = Some(trial);
+
+                if planned.is_empty() {
+                    None
+                } else {
+                    let best_index = if planned.len() >= CANDIDATE_SCORE_PARALLEL_THRESHOLD {
+                        evaluator
+                            .best_candidate_metrics_parallel(&planned)
+                            .map(|(index, _)| index)
+                    } else {
+                        let mut best_choice: Option<(usize, f64)> = None;
+                        for (index, changes) in planned.iter().enumerate() {
+                            let metrics = evaluator.evaluate_prepared_candidate_metrics(changes);
+                            best_choice =
+                                Some(best_metric_choice(best_choice, (index, metrics.total)));
+                        }
+                        best_choice.map(|(index, _)| index)
+                    };
+
+                    best_index.and_then(|index| {
+                        planned
+                            .get(index)
+                            .cloned()
+                            .map(|changes| evaluator.evaluate_prepared_candidate(changes))
+                    })
                 }
-            }
+            };
 
             if let Some(trial) = best_trial {
+                if trial.metrics().total + 1e-9 >= evaluator.metrics().total {
+                    continue;
+                }
                 evaluator.apply_candidate(trial);
                 occupancy = occupancy_map(
                     evaluator.placements(),
@@ -893,6 +1007,22 @@ fn refine_solution(
         placements: evaluator.placements().to_vec(),
         metrics: evaluator.metrics().clone(),
     }
+}
+
+fn best_metric_choice(current: Option<(usize, f64)>, candidate: (usize, f64)) -> (usize, f64) {
+    match current {
+        Some(best) => match candidate.1.total_cmp(&best.1) {
+            std::cmp::Ordering::Less => candidate,
+            std::cmp::Ordering::Equal if candidate.0 < best.0 => candidate,
+            _ => best,
+        },
+        None => candidate,
+    }
+}
+
+fn should_parallel_score(context: &SolveContext<'_>, candidate_count: usize) -> bool {
+    candidate_count >= CANDIDATE_SCORE_PARALLEL_THRESHOLD
+        && context.movable.len() >= CANDIDATE_SCORE_PARALLEL_MIN_MOVABLE_CLUSTERS
 }
 
 fn refinement_focus_order(context: &SolveContext<'_>) -> Vec<ClusterId> {
