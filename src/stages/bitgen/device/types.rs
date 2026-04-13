@@ -155,7 +155,12 @@ impl DeviceCell {
     pub fn register_init_value(&self) -> Option<SequentialInitValue> {
         self.primitive_kind()
             .is_sequential()
-            .then(|| self.property("init").and_then(SequentialInitValue::parse))
+            .then(|| {
+                SequentialInitValue::from_explicit_or_type_name(
+                    self.property("init"),
+                    &self.type_name,
+                )
+            })
             .flatten()
     }
 
@@ -305,4 +310,22 @@ fn trailing_index(raw: &str) -> Option<usize> {
         .find(|ch| ch.is_ascii_digit())
         .and_then(|ch| ch.to_digit(10))
         .map(|digit| digit as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeviceCell;
+    use crate::{domain::CellKind, domain::SequentialInitValue};
+
+    #[test]
+    fn register_init_value_falls_back_to_cpp_ff_type_defaults() {
+        let ff_low = DeviceCell::new("ff_low", CellKind::Ff, "DFFRHQ");
+        let ff_high = DeviceCell::new("ff_high", CellKind::Ff, "DFFSHQ");
+
+        assert_eq!(ff_low.register_init_value(), Some(SequentialInitValue::Low));
+        assert_eq!(
+            ff_high.register_init_value(),
+            Some(SequentialInitValue::High)
+        );
+    }
 }

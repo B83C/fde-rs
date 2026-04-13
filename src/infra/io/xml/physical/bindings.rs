@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::writer::{
     SLICE_DEFAULT_CONFIGS, SliceCellBinding, SliceCellKind, default_config_map, ordered_configs,
-    packed_lut_function_name,
+    physical_lut_function_name,
 };
-use crate::domain::SequentialInitValue;
+use crate::domain::{SequentialInitValue, SliceSequentialConfigKey, SliceSlot};
 
 pub(super) fn assign_cluster_cells(
     design: &Design,
@@ -39,6 +39,9 @@ pub(super) fn build_slice_configs(
 ) -> Vec<(String, String)> {
     let mut configs = default_config_map(SLICE_DEFAULT_CONFIGS);
     for (cell_name, binding) in cells {
+        let Some(slot) = SliceSlot::from_index(binding.slot.min(1)) else {
+            continue;
+        };
         let Some(cell) = design
             .cells
             .iter()
@@ -47,50 +50,82 @@ pub(super) fn build_slice_configs(
             continue;
         };
         if binding.kind == SliceCellKind::Lut
-            && let Some(function) = packed_lut_function_name(cell)
+            && let Some(function) = physical_lut_function_name(cell)
         {
-            let cfg_name = if binding.slot == 0 { "F" } else { "G" };
-            let mux_name = if binding.slot == 0 { "FXMUX" } else { "GYMUX" };
+            let cfg_name = slot.lut_config_name();
             configs.insert(cfg_name.to_string(), function);
-            configs.insert(mux_name.to_string(), cfg_name.to_string());
-            let used_name = if binding.slot == 0 { "XUSED" } else { "YUSED" };
+            configs.insert(slot.lut_mux_config_name().to_string(), cfg_name.to_string());
             let used_value = if lut_has_routed_sink(design, cell, cells, binding.slot) {
                 "0"
             } else {
                 "#OFF"
             };
-            configs.insert(used_name.to_string(), used_value.to_string());
+            configs.insert(
+                slot.lut_used_config_name().to_string(),
+                used_value.to_string(),
+            );
         }
         if binding.kind == SliceCellKind::Sequential {
-            let ff_name = if binding.slot == 0 { "FFX" } else { "FFY" };
-            let init_name = if binding.slot == 0 { "INITX" } else { "INITY" };
-            let d_name = if binding.slot == 0 { "DXMUX" } else { "DYMUX" };
-            let b_name = if binding.slot == 0 { "BXMUX" } else { "BYMUX" };
-            let xused_name = if binding.slot == 0 { "XUSED" } else { "YUSED" };
-            configs.insert(ff_name.to_string(), "#FF".to_string());
+            configs.insert(slot.ff_config_name().to_string(), "#FF".to_string());
             configs.insert(
-                init_name.to_string(),
+                slot.init_config_name().to_string(),
                 cell.register_init_value()
                     .unwrap_or(SequentialInitValue::Low)
                     .as_config_value()
                     .to_string(),
             );
-            configs.insert("SYNC_ATTR".to_string(), "ASYNC".to_string());
-            configs.insert("CKINV".to_string(), "1".to_string());
-            if ff_uses_clock_enable(cell) {
-                configs.insert("CEMUX".to_string(), "CE".to_string());
+            configs.insert(
+                SliceSequentialConfigKey::SyncAttr.as_str().to_string(),
+                cell.property("SYNC_ATTR").unwrap_or("ASYNC").to_string(),
+            );
+            configs.insert(
+                SliceSequentialConfigKey::ClockInvert.as_str().to_string(),
+                cell.property("CKINV")
+                    .unwrap_or(if cell.register_clock_is_inverted() {
+                        "1"
+                    } else {
+                        "#OFF"
+                    })
+                    .to_string(),
+            );
+            if let Some(value) = cell.property("CEMUX").filter(|value| *value != "#OFF") {
+                configs.insert(
+                    SliceSequentialConfigKey::ClockEnableMux
+                        .as_str()
+                        .to_string(),
+                    value.to_string(),
+                );
+            } else if ff_uses_clock_enable(cell) {
+                configs.insert(
+                    SliceSequentialConfigKey::ClockEnableMux
+                        .as_str()
+                        .to_string(),
+                    "CE".to_string(),
+                );
+            }
+            if let Some(value) = cell.property("SRMUX").filter(|value| *value != "#OFF") {
+                configs.insert(
+                    SliceSequentialConfigKey::SetResetMux.as_str().to_string(),
+                    value.to_string(),
+                );
+            }
+            if let Some(value) = cell.property("SRFFMUX").filter(|value| *value != "#OFF") {
+                configs.insert(
+                    SliceSequentialConfigKey::SetResetFfMux.as_str().to_string(),
+                    value.to_string(),
+                );
             }
             if ff_uses_site_bypass(design, cell, cells, binding.slot) {
-                configs.insert(d_name.to_string(), "0".to_string());
+                configs.insert(slot.data_mux_config_name().to_string(), "0".to_string());
                 configs.insert(
-                    b_name.to_string(),
-                    if binding.slot == 0 { "BX" } else { "BY" }.to_string(),
+                    slot.bypass_mux_config_name().to_string(),
+                    slot.bypass_function_name().to_string(),
                 );
             } else {
-                configs.insert(d_name.to_string(), "1".to_string());
+                configs.insert(slot.data_mux_config_name().to_string(), "1".to_string());
             }
             configs
-                .entry(xused_name.to_string())
+                .entry(slot.lut_used_config_name().to_string())
                 .or_insert_with(|| "#OFF".to_string());
         }
     }
@@ -164,6 +199,7 @@ fn lut_has_routed_sink(
 #[cfg(test)]
 mod tests {
     use super::{SliceCellBinding, SliceCellKind, build_slice_configs};
+    use crate::infra::io::xml::lut_expr::PHYSICAL_LUT_FUNCTION_PROPERTY;
     use crate::ir::{Cell, CellKind, Design};
     use std::collections::BTreeMap;
 
@@ -189,6 +225,65 @@ mod tests {
             configs
                 .iter()
                 .any(|(name, value)| name == "INITX" && value == "HIGH")
+        );
+    }
+
+    #[test]
+    fn slice_configs_preserve_imported_ff_site_control_muxes() {
+        let mut ff = Cell::new("ff0", CellKind::Ff, "DFFHQ");
+        ff.set_property("SYNC_ATTR", "ASYNC");
+        ff.set_property("CKINV", "1");
+        ff.set_property("SRMUX", "SR_B");
+        ff.set_property("SRFFMUX", "0");
+        let design = Design {
+            cells: vec![ff],
+            ..Design::default()
+        };
+        let bindings = BTreeMap::from([(
+            "ff0".to_string(),
+            SliceCellBinding {
+                slot: 0,
+                kind: SliceCellKind::Sequential,
+            },
+        )]);
+
+        let configs = build_slice_configs(&design, &bindings);
+
+        assert!(
+            configs
+                .iter()
+                .any(|(name, value)| name == "SRMUX" && value == "SR_B")
+        );
+        assert!(
+            configs
+                .iter()
+                .any(|(name, value)| name == "SRFFMUX" && value == "0")
+        );
+    }
+
+    #[test]
+    fn slice_configs_preserve_imported_cpp_constant_lut_function_spelling() {
+        let mut lut = Cell::new("lut0", CellKind::Lut, "LUT4");
+        lut.set_property("lut_init", "0xFFFF");
+        lut.set_property(PHYSICAL_LUT_FUNCTION_PROPERTY, "#LUT:D=1");
+        let design = Design {
+            cells: vec![lut],
+            ..Design::default()
+        };
+        let bindings = BTreeMap::from([(
+            "lut0".to_string(),
+            SliceCellBinding {
+                slot: 0,
+                kind: SliceCellKind::Lut,
+            },
+        )]);
+
+        let configs = build_slice_configs(&design, &bindings);
+
+        assert!(
+            configs
+                .iter()
+                .any(|(name, value)| name == "F" && value == "#LUT:D=1")
         );
     }
 }

@@ -40,6 +40,7 @@ pub(crate) enum SiteProgramKind {
 pub(crate) struct SliceProgram {
     pub(crate) slots: [SliceSlotProgram; 2],
     pub(crate) clock_enable_mode: SliceClockEnableMode,
+    pub(crate) set_reset_mode: SliceSetResetMode,
 }
 
 impl SliceProgram {
@@ -83,6 +84,13 @@ pub(crate) enum SliceClockEnableMode {
     #[default]
     None,
     DirectCe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SliceSetResetMode {
+    #[default]
+    None,
+    ActiveLowShared,
 }
 
 #[derive(Debug, Clone, Default)]

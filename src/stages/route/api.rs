@@ -239,6 +239,7 @@ fn derive_segments_from_pips(pips: &[RoutePip]) -> Vec<RouteSegment> {
 mod tests {
     use crate::{
         cil::load_cil,
+        constraints::load_constraints,
         domain::{CellKind, ClusterKind},
         ir::{Cell, Cluster, Design, Endpoint, Net, Port, RoutePip, RouteSegment},
         resource::{ResourceBundle, load_arch},
@@ -428,6 +429,150 @@ mod tests {
                     || warning.contains("could not find a Rust route")),
             "single-port BRAM data/control pins should route without BRAM-specific warnings"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn route_stage_uses_dedicated_clock_sink_path_for_block_ram_clock() -> anyhow::Result<()> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let Some(bundle) = ResourceBundle::discover_from(&repo_root).ok() else {
+            return Ok(());
+        };
+        let arch_path = bundle.root.join("fdp3p7_arch.xml");
+        let cil_path = bundle.root.join("fdp3p7_cil.xml");
+        let constraints_path = repo_root.join("tests/fixtures/fdp3p7-constraints.xml");
+        if !arch_path.exists() || !cil_path.exists() || !constraints_path.exists() {
+            return Ok(());
+        }
+
+        let arch = load_arch(&arch_path)?;
+        let cil = load_cil(&cil_path)?;
+        let constraints = load_constraints(&constraints_path)?;
+
+        let mut gnd = Cell::new("GND", CellKind::Lut, "LUT4")
+            .with_output("O", "GND_NET")
+            .in_cluster("clb_gnd");
+        gnd.set_property("lut_init", "0x0000");
+
+        let mut ram = Cell::new("ram", CellKind::BlockRam, "BLOCKRAM_1")
+            .with_input("ADDR0", "GND_NET")
+            .with_input("ADDR1", "GND_NET")
+            .with_input("ADDR2", "GND_NET")
+            .with_input("ADDR3", "GND_NET")
+            .with_input("ADDR4", "GND_NET")
+            .with_input("ADDR5", "GND_NET")
+            .with_input("ADDR6", "GND_NET")
+            .with_input("ADDR7", "GND_NET")
+            .with_input("ADDR8", "GND_NET")
+            .with_input("ADDR9", "GND_NET")
+            .with_input("ADDR10", "GND_NET")
+            .with_input("ADDR11", "GND_NET")
+            .with_input("CLK", "clk")
+            .with_input("DI", "GND_NET")
+            .with_input("EN", "GND_NET")
+            .with_input("RST", "GND_NET")
+            .with_input("WE", "GND_NET")
+            .in_cluster("bram0");
+        ram.set_property("PORT_ATTR", "4096X1");
+
+        let ff = Cell::ff("ff0", "DFFHQ")
+            .with_input("D", "GND_NET")
+            .with_input("CLK", "clk")
+            .in_cluster("clb_ff");
+
+        let gnd_net = [
+            Endpoint::cell("ram", "ADDR0"),
+            Endpoint::cell("ram", "ADDR1"),
+            Endpoint::cell("ram", "ADDR2"),
+            Endpoint::cell("ram", "ADDR3"),
+            Endpoint::cell("ram", "ADDR4"),
+            Endpoint::cell("ram", "ADDR5"),
+            Endpoint::cell("ram", "ADDR6"),
+            Endpoint::cell("ram", "ADDR7"),
+            Endpoint::cell("ram", "ADDR8"),
+            Endpoint::cell("ram", "ADDR9"),
+            Endpoint::cell("ram", "ADDR10"),
+            Endpoint::cell("ram", "ADDR11"),
+            Endpoint::cell("ram", "DI"),
+            Endpoint::cell("ram", "EN"),
+            Endpoint::cell("ram", "RST"),
+            Endpoint::cell("ram", "WE"),
+            Endpoint::cell("ff0", "D"),
+        ]
+        .into_iter()
+        .fold(
+            Net::new("GND_NET").with_driver(Endpoint::cell("GND", "O")),
+            |net, sink| net.with_sink(sink),
+        );
+
+        let design = Design {
+            name: "bram-clock-route".to_string(),
+            stage: "placed".to_string(),
+            ports: vec![Port::input("clk")],
+            cells: vec![gnd, ram, ff],
+            nets: vec![
+                gnd_net,
+                Net::new("clk")
+                    .with_driver(Endpoint::port("clk", "IN"))
+                    .with_sink(Endpoint::cell("ram", "CLK"))
+                    .with_sink(Endpoint::cell("ff0", "CLK")),
+            ],
+            clusters: vec![
+                Cluster::new("bram0", ClusterKind::BlockRam)
+                    .with_member("ram")
+                    .with_capacity(1)
+                    .fixed_at_slot(4, 0, 0),
+                Cluster::logic("clb_gnd")
+                    .with_member("GND")
+                    .with_capacity(4)
+                    .fixed_at_slot(4, 2, 0),
+                Cluster::logic("clb_ff")
+                    .with_member("ff0")
+                    .with_capacity(4)
+                    .fixed_at_slot(5, 2, 0),
+            ],
+            ..Design::default()
+        };
+
+        let device_design =
+            crate::route::lower_design(design.clone(), &arch, Some(&cil), &constraints)?;
+        let result = super::run_with_artifacts(
+            design,
+            &RouteOptions {
+                arch: std::sync::Arc::new(arch),
+                arch_path,
+                constraints: constraints.into(),
+                cil: Some(cil),
+                device_design: Some(device_design),
+            },
+        )?;
+
+        let clock_pips = result
+            .value
+            .route_image
+            .pips
+            .iter()
+            .filter(|pip| pip.net_name == "clk")
+            .collect::<Vec<_>>();
+
+        assert!(
+            clock_pips
+                .iter()
+                .any(|pip| pip.to_net == "BRAM_CLKA" && pip.from_net.starts_with("BRAM_GCLKIN")),
+            "expected dedicated BRAM clock sink arc on logical clk net, got {:?}",
+            clock_pips
+                .iter()
+                .filter(|pip| pip.to_net == "BRAM_CLKA" || pip.from_net.starts_with("BRAM_"))
+                .map(|pip| (pip.x, pip.y, pip.from_net.as_str(), pip.to_net.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !clock_pips.iter().any(|pip| {
+                pip.to_net == "BRAM_CLKA" && !pip.from_net.starts_with("BRAM_GCLKIN")
+            }),
+            "BRAM clock sink should not be reached from generic local wires"
+        );
+
         Ok(())
     }
 }

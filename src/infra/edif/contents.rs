@@ -141,7 +141,7 @@ impl Parser<'_> {
                 self.expect_lparen()?;
                 let head = self.expect_atom()?;
                 match head.as_str() {
-                    "joined" => endpoints.extend(self.parse_joined()?),
+                    "joined" => endpoints.extend(self.parse_joined(builder)?),
                     _ => self.skip_current_list()?,
                 }
             } else {
@@ -154,14 +154,14 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn parse_joined(&mut self) -> Result<Vec<PendingEndpoint>> {
+    fn parse_joined(&mut self, builder: &DesignBuilder) -> Result<Vec<PendingEndpoint>> {
         let mut endpoints = Vec::new();
         while !self.peek_is_rparen()? {
             if self.peek_is_lparen()? {
                 self.expect_lparen()?;
                 let head = self.expect_atom()?;
                 match head.as_str() {
-                    "portRef" => endpoints.push(self.parse_port_ref()?),
+                    "portRef" => endpoints.push(self.parse_port_ref(builder)?),
                     _ => self.skip_current_list()?,
                 }
             } else {
@@ -172,7 +172,7 @@ impl Parser<'_> {
         Ok(endpoints)
     }
 
-    fn parse_port_ref(&mut self) -> Result<PendingEndpoint> {
+    fn parse_port_ref(&mut self, builder: &DesignBuilder) -> Result<PendingEndpoint> {
         let parsed_pin = self
             .parse_name_expr()?
             .ok_or_else(|| self.error("malformed portRef"))?;
@@ -191,8 +191,15 @@ impl Parser<'_> {
                 let head = self.expect_atom()?;
                 match head.as_str() {
                     "instanceRef" => {
-                        target = EndpointTarget::InstanceRef(self.parse_instance_ref()?);
-                        pin = raw_pin.clone();
+                        let instance_ref = self.parse_instance_ref()?;
+                        pin = parsed_pin
+                            .member
+                            .as_ref()
+                            .and_then(|member| {
+                                builder.resolve_instance_port_member(&instance_ref, member)
+                            })
+                            .unwrap_or_else(|| raw_pin.clone());
+                        target = EndpointTarget::InstanceRef(instance_ref);
                     }
                     _ => self.skip_current_list()?,
                 }

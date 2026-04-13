@@ -5,7 +5,7 @@ mod physical_xml;
 use crate::{
     cil::Cil,
     constraints::ConstraintEntry,
-    ir::{Design, PortDirection, RoutePip},
+    ir::{Design, RoutePip},
     resource::Arch,
 };
 use anyhow::{Context, Result};
@@ -13,6 +13,7 @@ use quick_xml::{
     Writer,
     events::{BytesEnd, BytesStart, Event},
 };
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -72,6 +73,38 @@ const GCLKIOB_PORTS: &[PhysicalPortDesc] = &[
     PhysicalPortDesc::new("PAD", "inout"),
     PhysicalPortDesc::new("GCLKOUT", "output"),
 ];
+
+fn blockram_ports() -> Vec<PhysicalPortDesc> {
+    let mut ports = vec![
+        PhysicalPortDesc::new("CKA", "input"),
+        PhysicalPortDesc::new("AWE", "input"),
+        PhysicalPortDesc::new("AEN", "input"),
+        PhysicalPortDesc::new("RSTA", "input"),
+        PhysicalPortDesc::new("CKB", "input"),
+        PhysicalPortDesc::new("BWE", "input"),
+        PhysicalPortDesc::new("BEN", "input"),
+        PhysicalPortDesc::new("RSTB", "input"),
+    ];
+    for index in 0..12 {
+        ports.push(PhysicalPortDesc::owned(format!("ADDRA_{index}"), "input"));
+    }
+    for index in 0..12 {
+        ports.push(PhysicalPortDesc::owned(format!("ADDRB_{index}"), "input"));
+    }
+    for index in 0..16 {
+        ports.push(PhysicalPortDesc::owned(format!("DINA{index}"), "input"));
+    }
+    for index in 0..16 {
+        ports.push(PhysicalPortDesc::owned(format!("DINB{index}"), "input"));
+    }
+    for index in 0..16 {
+        ports.push(PhysicalPortDesc::owned(format!("DOUTA{index}"), "output"));
+    }
+    for index in 0..16 {
+        ports.push(PhysicalPortDesc::owned(format!("DOUTB{index}"), "output"));
+    }
+    ports
+}
 
 pub(super) const SLICE_DEFAULT_CONFIGS: &[(&str, &str)] = &[
     ("BXMUX", "#OFF"),
@@ -173,23 +206,33 @@ pub(super) fn is_clock_input_port(design: &Design, port_name: &str) -> bool {
     logical::is_clock_input_port(design, port_name)
 }
 
-pub(super) fn packed_lut_function_name(cell: &crate::ir::Cell) -> Option<String> {
-    logical::packed_lut_function_name(cell)
+pub(super) fn physical_lut_function_name(cell: &crate::ir::Cell) -> Option<String> {
+    logical::physical_lut_function_name(cell)
 }
 
 pub(super) fn pin_map_indices(cell: &crate::ir::Cell, logical_index: usize) -> Vec<usize> {
     logical::pin_map_indices(cell, logical_index)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PhysicalPortDesc {
-    name: &'static str,
+    name: Cow<'static, str>,
     direction: &'static str,
 }
 
 impl PhysicalPortDesc {
     const fn new(name: &'static str, direction: &'static str) -> Self {
-        Self { name, direction }
+        Self {
+            name: Cow::Borrowed(name),
+            direction,
+        }
+    }
+
+    fn owned(name: String, direction: &'static str) -> Self {
+        Self {
+            name: Cow::Owned(name),
+            direction,
+        }
     }
 }
 
@@ -239,7 +282,8 @@ pub(super) struct SliceCellBinding {
 #[derive(Debug, Clone)]
 pub(super) struct PortInstanceBinding {
     pub(super) port_name: String,
-    pub(super) direction: PortDirection,
+    pub(super) input_used: bool,
+    pub(super) output_used: bool,
     pub(super) pad_instance_name: String,
     pub(super) pad_module_ref: &'static str,
     pub(super) pad_position: Option<(usize, usize, usize)>,

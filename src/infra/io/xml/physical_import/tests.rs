@@ -1,5 +1,7 @@
 use super::load_fde_physical_design_xml;
-use crate::ir::{RoutePip, RouteSegment};
+use crate::domain::ClusterKind;
+use crate::infra::io::xml::lut_expr::PHYSICAL_LUT_FUNCTION_PROPERTY;
+use crate::ir::{CellKind, RoutePip, RouteSegment};
 
 #[test]
 fn physical_import_merges_clock_bridge_pips_back_into_clock_net() {
@@ -282,6 +284,10 @@ fn physical_import_preserves_cpp_constant_zero_lut_outputs() {
             |cell| cell.name == "iSlice__0__::lut1" && cell.property("lut_init") == Some("0x0")
         )
     );
+    assert!(design.cells.iter().any(|cell| {
+        cell.name == "iSlice__0__::lut1"
+            && cell.property(PHYSICAL_LUT_FUNCTION_PROPERTY) == Some("#LUT:D=0")
+    }));
     let led_net = design
         .nets
         .iter()
@@ -293,5 +299,202 @@ fn physical_import_preserves_cpp_constant_zero_lut_outputs() {
             .as_ref()
             .map(|endpoint| endpoint.name.as_str()),
         Some("iSlice__0__::lut1")
+    );
+}
+
+#[test]
+fn physical_import_preserves_ff_site_control_mux_configs() {
+    let xml = r##"
+<design name="ff_site_cfg_import">
+  <external name="template_work_lib">
+    <module name="slice" type="SLICE">
+      <port name="CLK" direction="input" capacitance="0.00000"/>
+      <port name="SR" direction="input" capacitance="0.00000"/>
+      <port name="XQ" direction="output" capacitance="0.00000"/>
+    </module>
+  </external>
+  <library name="work_lib">
+    <module name="ff_site_cfg_import" type="GENERIC">
+      <contents>
+        <instance name="iSlice__0__" moduleRef="slice" libraryRef="template_work_lib">
+          <property name="position" type="point" value="10,10,0"/>
+          <config name="CKINV" value="1"/>
+          <config name="DXMUX" value="1"/>
+          <config name="FFX" value="#FF"/>
+          <config name="INITX" value="HIGH"/>
+          <config name="SYNC_ATTR" value="ASYNC"/>
+          <config name="SRMUX" value="SR_B"/>
+          <config name="SRFFMUX" value="0"/>
+        </instance>
+        <net name="clk">
+          <portRef name="CLK" instanceRef="iSlice__0__"/>
+        </net>
+        <net name="rst">
+          <portRef name="SR" instanceRef="iSlice__0__"/>
+        </net>
+        <net name="q">
+          <portRef name="XQ" instanceRef="iSlice__0__"/>
+        </net>
+      </contents>
+    </module>
+  </library>
+  <topModule libraryRef="work_lib" name="ff_site_cfg_import"/>
+</design>
+"##;
+
+    let document = roxmltree::Document::parse(xml).expect("physical XML should parse");
+    let design = load_fde_physical_design_xml(document.root_element())
+        .expect("physical import should succeed");
+
+    let ff = design
+        .cells
+        .iter()
+        .find(|cell| cell.name == "iSlice__0__::ff0")
+        .expect("ff cell");
+    assert_eq!(ff.kind, CellKind::Ff);
+    assert_eq!(ff.property("init"), Some("1"));
+    assert_eq!(ff.property("SYNC_ATTR"), Some("ASYNC"));
+    assert_eq!(ff.property("CKINV"), Some("1"));
+    assert_eq!(ff.property("SRMUX"), Some("SR_B"));
+    assert_eq!(ff.property("SRFFMUX"), Some("0"));
+}
+
+#[test]
+fn physical_import_recovers_block_ram_cells_configs_and_endpoints() {
+    let xml = r##"
+<design name="bram_import">
+  <external name="template_work_lib">
+    <module name="slice" type="SLICE">
+      <port name="F1" direction="input" capacitance="0.00000"/>
+      <port name="Y" direction="output" capacitance="0.00000"/>
+    </module>
+    <module name="blockram" type="BLOCKRAM">
+      <port name="CKA" direction="input" capacitance="0.00000"/>
+      <port name="DINA0" direction="input" capacitance="0.00000"/>
+      <port name="DOUTA0" direction="output" capacitance="0.00000"/>
+    </module>
+  </external>
+  <library name="work_lib">
+    <module name="bram_import" type="GENERIC">
+      <contents>
+        <instance name="iSlice__0__" moduleRef="slice" libraryRef="template_work_lib">
+          <property name="position" type="point" value="10,10,0"/>
+          <config name="G" value="#LUT:D=1"/>
+          <config name="GYMUX" value="G"/>
+          <config name="YUSED" value="0"/>
+        </instance>
+        <instance name="iSlice__1__" moduleRef="slice" libraryRef="template_work_lib">
+          <property name="position" type="point" value="11,10,0"/>
+          <config name="F" value="#LUT:D=0"/>
+          <config name="FXMUX" value="F"/>
+          <config name="XUSED" value="0"/>
+        </instance>
+        <instance name="iBram__0__" moduleRef="blockram" libraryRef="template_work_lib">
+          <property name="position" type="point" value="16,54,0"/>
+          <config name="CLKAMUX" value="1"/>
+          <config name="PORTA_ATTR" value="512X8"/>
+          <config name="ENAMUX" value="ENA"/>
+          <config name="WEAMUX" value="WEA"/>
+          <config name="RSTAMUX" value="RSTA"/>
+          <config name="PORTB_ATTR" value="#OFF"/>
+          <config name="INIT_00" value="0000000000000000000000000000000000000000000000000000000000000000"/>
+        </instance>
+        <net name="clk">
+          <portRef name="Y" instanceRef="iSlice__0__"/>
+          <portRef name="CKA" instanceRef="iBram__0__"/>
+        </net>
+        <net name="din">
+          <portRef name="Y" instanceRef="iSlice__0__"/>
+          <portRef name="DINA0" instanceRef="iBram__0__"/>
+        </net>
+        <net name="dout">
+          <portRef name="DOUTA0" instanceRef="iBram__0__"/>
+          <portRef name="F1" instanceRef="iSlice__1__"/>
+        </net>
+      </contents>
+    </module>
+  </library>
+  <topModule libraryRef="work_lib" name="bram_import"/>
+</design>
+"##;
+
+    let document = roxmltree::Document::parse(xml).expect("physical XML should parse");
+    let design = load_fde_physical_design_xml(document.root_element())
+        .expect("physical import should succeed");
+
+    assert!(design.cells.iter().any(
+        |cell| cell.name == "iSlice__0__::lut1" && cell.property("lut_init") == Some("0xFFFF")
+    ));
+    assert!(design.cells.iter().any(|cell| {
+        cell.name == "iSlice__0__::lut1"
+            && cell.property(PHYSICAL_LUT_FUNCTION_PROPERTY) == Some("#LUT:D=1")
+    }));
+    assert!(design.cells.iter().any(|cell| {
+        cell.name == "iSlice__1__::lut0"
+            && cell.property(PHYSICAL_LUT_FUNCTION_PROPERTY) == Some("#LUT:D=0")
+    }));
+    let bram = design
+        .cells
+        .iter()
+        .find(|cell| cell.name == "iBram__0__")
+        .expect("block ram cell");
+    assert_eq!(bram.kind, CellKind::BlockRam);
+    assert_eq!(bram.type_name, "BLOCKRAM_1");
+    assert_eq!(bram.property("PORTA_ATTR"), Some("512X8"));
+    assert_eq!(bram.property("PORTB_ATTR"), Some("#OFF"));
+    assert_eq!(
+        bram.property("INIT_00"),
+        Some("0000000000000000000000000000000000000000000000000000000000000000")
+    );
+    assert!(
+        bram.inputs
+            .iter()
+            .any(|pin| pin.port == "CKA" && pin.net == "clk")
+    );
+    assert!(
+        bram.inputs
+            .iter()
+            .any(|pin| pin.port == "DIA0" && pin.net == "din")
+    );
+    assert!(
+        bram.outputs
+            .iter()
+            .any(|pin| pin.port == "DOA0" && pin.net == "dout")
+    );
+
+    let bram_cluster = design
+        .clusters
+        .iter()
+        .find(|cluster| cluster.name == "iBram__0__")
+        .expect("block ram cluster");
+    assert_eq!(bram_cluster.kind, ClusterKind::BlockRam);
+    assert_eq!(bram_cluster.members, vec!["iBram__0__".to_string()]);
+    assert_eq!(
+        (bram_cluster.x, bram_cluster.y, bram_cluster.z),
+        (Some(16), Some(54), Some(0))
+    );
+
+    let din_net = design
+        .nets
+        .iter()
+        .find(|net| net.name == "din")
+        .expect("din net");
+    assert!(
+        din_net
+            .sinks
+            .iter()
+            .any(|endpoint| endpoint.name == "iBram__0__" && endpoint.pin == "DIA0")
+    );
+    let dout_net = design
+        .nets
+        .iter()
+        .find(|net| net.name == "dout")
+        .expect("dout net");
+    assert_eq!(
+        dout_net
+            .driver
+            .as_ref()
+            .map(|endpoint| (endpoint.name.as_str(), endpoint.pin.as_str())),
+        Some(("iBram__0__", "DOA0"))
     );
 }

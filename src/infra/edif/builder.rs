@@ -1,4 +1,4 @@
-use super::ParsedName;
+use super::{ArraySpec, ParsedMember, ParsedName};
 use crate::{
     domain::{CellKind, PinRole, PrimitiveKind},
     ir::{Cell, CellPin, Design, Endpoint, EndpointKind, Net, Port, PortDirection},
@@ -29,7 +29,9 @@ pub(super) struct DesignBuilder {
     design: Design,
     cell_types: BTreeMap<String, String>,
     library_cell_names: BTreeMap<String, String>,
+    library_cell_port_arrays: BTreeMap<String, BTreeMap<String, ArraySpec>>,
     instance_names: BTreeMap<String, String>,
+    instance_types: BTreeMap<String, String>,
     pending_nets: Vec<PendingNet>,
 }
 
@@ -46,7 +48,9 @@ impl DesignBuilder {
             design,
             cell_types: BTreeMap::new(),
             library_cell_names: BTreeMap::new(),
+            library_cell_port_arrays: BTreeMap::new(),
             instance_names: BTreeMap::new(),
+            instance_types: BTreeMap::new(),
             pending_nets: Vec::new(),
         }
     }
@@ -60,7 +64,10 @@ impl DesignBuilder {
             cell.type_name = resolved_type_name.clone();
         }
         cell.kind = classify_cell_kind(&cell.type_name);
-        self.instance_names.insert(instance_ref, cell.name.clone());
+        self.instance_names
+            .insert(instance_ref.clone(), cell.name.clone());
+        self.instance_types
+            .insert(instance_ref, cell.type_name.clone());
         self.cell_types
             .insert(cell.name.clone(), cell.type_name.clone());
         self.design.cells.push(cell);
@@ -69,6 +76,34 @@ impl DesignBuilder {
     pub(super) fn register_library_cell(&mut self, name: ParsedName) {
         self.library_cell_names
             .insert(name.stable_name, name.display);
+    }
+
+    pub(super) fn register_library_cell_port_array(
+        &mut self,
+        cell_name: &str,
+        array_key: &str,
+        array_spec: ArraySpec,
+    ) {
+        self.library_cell_port_arrays
+            .entry(cell_name.to_string())
+            .or_default()
+            .insert(array_key.to_string(), array_spec);
+    }
+
+    pub(super) fn resolve_instance_port_member(
+        &self,
+        instance_name: &str,
+        member: &ParsedMember,
+    ) -> Option<String> {
+        let cell_type = self.instance_types.get(instance_name)?;
+        self.library_cell_port_arrays
+            .get(cell_type)?
+            .get(&member.base_key)
+            .and_then(|array_spec| {
+                array_spec
+                    .range
+                    .member_name(&array_spec.display_base, member.ordinal)
+            })
     }
 
     pub(super) fn push_net(&mut self, net: PendingNet) {

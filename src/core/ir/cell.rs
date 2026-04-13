@@ -1,5 +1,6 @@
-use crate::domain::ascii::trimmed_contains_ignore_ascii_case;
-use crate::domain::{CellKind, ConstantKind, PrimitiveKind, SequentialInitValue};
+use crate::domain::{
+    CellKind, ConstantKind, PrimitiveKind, SequentialCellType, SequentialInitValue,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{CellPin, Property};
@@ -140,7 +141,12 @@ impl Cell {
 
     pub fn register_init_value(&self) -> Option<SequentialInitValue> {
         self.is_sequential()
-            .then(|| self.property("init").and_then(SequentialInitValue::parse))
+            .then(|| {
+                SequentialInitValue::from_explicit_or_type_name(
+                    self.property("init"),
+                    &self.type_name,
+                )
+            })
             .flatten()
     }
 
@@ -148,7 +154,8 @@ impl Cell {
         self.is_sequential()
             && (self.inputs.iter().any(|pin| {
                 pin.port.eq_ignore_ascii_case("CKN") || pin.port.eq_ignore_ascii_case("CLKN")
-            }) || trimmed_contains_ignore_ascii_case(&self.type_name, "dffn"))
+            }) || SequentialCellType::from_type_name(&self.type_name)
+                .is_some_and(SequentialCellType::clock_is_inverted_by_default))
     }
 
     fn input_net_matching(
@@ -187,6 +194,21 @@ mod tests {
 
         assert_eq!(
             ff.register_init_value(),
+            Some(super::SequentialInitValue::High)
+        );
+    }
+
+    #[test]
+    fn register_init_value_falls_back_to_cpp_ff_type_defaults() {
+        let ff_low = Cell::ff("ff_low", "DFFRHQ");
+        let ff_high = Cell::ff("ff_high", "DFFSHQ");
+
+        assert_eq!(
+            ff_low.register_init_value(),
+            Some(super::SequentialInitValue::Low)
+        );
+        assert_eq!(
+            ff_high.register_init_value(),
             Some(super::SequentialInitValue::High)
         );
     }

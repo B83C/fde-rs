@@ -1,6 +1,8 @@
 use crate::bitgen::literal::parse_bit_literal;
 use std::collections::BTreeSet;
 
+pub(crate) const PHYSICAL_LUT_FUNCTION_PROPERTY: &str = "fde_physical_lut_function";
+
 const LUT_EXPR_TERMS: &[&[&str]] = &[
     &["~A1*A1", "A1", "~A1"],
     &[
@@ -87,8 +89,19 @@ pub(super) fn decode_lut_function(value: &str) -> Option<(String, usize)> {
     decode_lut_literal(value)
 }
 
+pub(crate) fn preserved_physical_lut_function(value: &str) -> Option<String> {
+    let value = value.trim();
+    matches!(value, "#LUT:D=0" | "#LUT:D=1").then(|| value.to_string())
+}
+
 fn decode_lut_expression(expr: &str) -> Option<(String, usize)> {
     let expr = expr.trim();
+    if expr == "0" {
+        return Some(("0x0".to_string(), 4));
+    }
+    if expr == "1" {
+        return Some(("0xFFFF".to_string(), 4));
+    }
     for (term_index, terms) in LUT_EXPR_TERMS.iter().enumerate() {
         let input_count = term_index + 1;
         if expr == terms[0] {
@@ -218,7 +231,7 @@ mod tests {
         );
         assert_eq!(
             decode_lut_function("#LUT:D=1"),
-            Some(("0x1".to_string(), 4))
+            Some(("0xFFFF".to_string(), 4))
         );
     }
 

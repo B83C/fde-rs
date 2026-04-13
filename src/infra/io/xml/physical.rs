@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::writer::{PhysicalDesignView, PhysicalInstance};
 use super::writer::{SliceCellBinding, XmlWriteContext};
+use crate::domain::ClusterKind;
 use bindings::{assign_cluster_cells, build_slice_configs};
 use nets::build_physical_nets;
 use ports::{build_pad_configs, build_port_bindings};
@@ -22,10 +23,16 @@ impl PhysicalDesignView {
 
         let index = design.index();
         let (slice_instances, cell_bindings) = slice_instances_and_bindings(design, &index);
+        let (block_ram_instances, block_ram_bindings) =
+            block_ram_instances_and_bindings(design, &index);
 
         let port_bindings = build_port_bindings(design, context);
         let mut used_modules = BTreeSet::from(["slice"]);
         let mut instances = slice_instances;
+        if !block_ram_instances.is_empty() {
+            used_modules.insert("blockram");
+            instances.extend(block_ram_instances);
+        }
 
         for instance in non_clock_port_instances(design, &port_bindings) {
             used_modules.insert(instance.module_ref);
@@ -46,7 +53,13 @@ impl PhysicalDesignView {
             return None;
         }
 
-        let nets = build_physical_nets(design, &index, &cell_bindings, &port_bindings);
+        let nets = build_physical_nets(
+            design,
+            &index,
+            &cell_bindings,
+            &block_ram_bindings,
+            &port_bindings,
+        );
         if nets.is_empty() {
             return None;
         }
@@ -85,6 +98,9 @@ fn slice_instances_and_bindings(
     let mut slice_instances = Vec::new();
     let mut cell_bindings = BTreeMap::<String, (String, SliceCellBinding)>::new();
     for (cluster_index, cluster) in design.clusters.iter().enumerate() {
+        if cluster.kind != ClusterKind::Logic {
+            continue;
+        }
         let instance_name = format!("iSlice__{cluster_index}__");
         let position = instance_position(design, cluster.x, cluster.y, cluster.z);
         let cells = assign_cluster_cells(design, index, ClusterId::new(cluster_index));
@@ -114,6 +130,53 @@ fn instance_position(
     (design.stage != "packed")
         .then(|| x.zip(y).map(|(x, y)| (x, y, z.unwrap_or(0))))
         .flatten()
+}
+
+fn block_ram_instances_and_bindings(
+    design: &Design,
+    index: &crate::ir::DesignIndex<'_>,
+) -> (Vec<PhysicalInstance>, BTreeMap<String, String>) {
+    let mut instances = Vec::new();
+    let mut bindings = BTreeMap::<String, String>::new();
+    let mut block_ram_index = 0usize;
+
+    for (cluster_index, cluster) in design.clusters.iter().enumerate() {
+        if cluster.kind != ClusterKind::BlockRam {
+            continue;
+        }
+        let cluster_id = ClusterId::new(cluster_index);
+        let members = index
+            .cluster_members(cluster_id)
+            .iter()
+            .copied()
+            .filter_map(|cell_id| {
+                let cell = index.cell(design, cell_id);
+                cell.is_block_ram().then_some(cell)
+            })
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            continue;
+        }
+
+        let instance_name = format!("iBram__{block_ram_index}__");
+        block_ram_index += 1;
+        for cell in &members {
+            bindings.insert(cell.name.clone(), instance_name.clone());
+        }
+        let cell = members[0];
+        instances.push(PhysicalInstance {
+            name: instance_name,
+            module_ref: "blockram",
+            position: instance_position(design, cluster.x, cluster.y, cluster.z),
+            configs: cell
+                .properties
+                .iter()
+                .map(|property| (property.key.clone(), property.value.clone()))
+                .collect(),
+        });
+    }
+
+    (instances, bindings)
 }
 
 fn non_clock_port_instances(
@@ -200,4 +263,134 @@ fn modules_used_by_port_bindings(
         }
     }
     used_modules
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::writer::{XmlWriteContext, save_design_xml};
+    use crate::{
+        domain::{CellKind, ClusterKind},
+        ir::{Cell, Cluster, Design, Endpoint, Net, Port, Property},
+    };
+
+    #[test]
+    fn physical_xml_emits_blockram_instances_and_endpoints() {
+        let mut ram = Cell::new("ram0", CellKind::BlockRam, "BLOCKRAM_1")
+            .in_cluster("bram_0000")
+            .with_input("CKA", "clk")
+            .with_input("DI0", "din")
+            .with_output("DO0", "dout");
+        ram.properties.push(Property::new("PORTA_ATTR", "512X8"));
+        ram.properties
+            .push(Property::new("INIT_00", "0123456789ABCDEF"));
+
+        let design = Design {
+            name: "bram_physical".to_string(),
+            stage: "routed".to_string(),
+            ports: vec![Port::input("clk"), Port::input("din"), Port::output("q")],
+            cells: vec![ram],
+            nets: vec![
+                Net::new("clk")
+                    .with_driver(Endpoint::port("clk", "clk"))
+                    .with_sink(Endpoint::cell("ram0", "CKA")),
+                Net::new("din")
+                    .with_driver(Endpoint::port("din", "din"))
+                    .with_sink(Endpoint::cell("ram0", "DI0")),
+                Net::new("dout")
+                    .with_driver(Endpoint::cell("ram0", "DO0"))
+                    .with_sink(Endpoint::port("q", "q")),
+            ],
+            clusters: vec![
+                Cluster::new("bram_0000", ClusterKind::BlockRam)
+                    .with_member("ram0")
+                    .at_slot(14, 54, 0),
+            ],
+            ..Design::default()
+        };
+
+        let xml = save_design_xml(&design, &XmlWriteContext::default()).expect("physical xml");
+        let doc = roxmltree::Document::parse(&xml).expect("parse xml");
+
+        assert!(
+            doc.descendants()
+                .any(|node| node.has_tag_name("module")
+                    && node.attribute("name") == Some("blockram"))
+        );
+        assert!(doc.descendants().any(|node| {
+            node.has_tag_name("instance")
+                && node.attribute("name") == Some("iBram__0__")
+                && node.attribute("moduleRef") == Some("blockram")
+        }));
+        assert!(doc.descendants().any(|node| {
+            node.has_tag_name("config")
+                && node.attribute("name") == Some("PORTA_ATTR")
+                && node.attribute("value") == Some("512X8")
+        }));
+        assert!(doc.descendants().any(|node| {
+            node.has_tag_name("portRef")
+                && node.attribute("name") == Some("CKA")
+                && node.attribute("instanceRef") == Some("iBram__0__")
+        }));
+        assert!(doc.descendants().any(|node| {
+            node.has_tag_name("portRef")
+                && node.attribute("name") == Some("DINA0")
+                && node.attribute("instanceRef") == Some("iBram__0__")
+        }));
+        assert!(doc.descendants().any(|node| {
+            node.has_tag_name("portRef")
+                && node.attribute("name") == Some("DOUTA0")
+                && node.attribute("instanceRef") == Some("iBram__0__")
+        }));
+    }
+
+    #[test]
+    fn physical_xml_keeps_unused_constrained_input_iob_disabled() {
+        let design = Design {
+            name: "unused_input".to_string(),
+            stage: "placed".to_string(),
+            ports: vec![
+                Port::input("din").at_site(1, 1, 0),
+                Port::input("uart_rx").at_site(2, 1, 0),
+                Port::output("dout").at_site(3, 1, 0),
+            ],
+            nets: vec![
+                Net::new("data")
+                    .with_driver(Endpoint::port("din", "din"))
+                    .with_sink(Endpoint::port("dout", "dout")),
+            ],
+            ..Design::default()
+        };
+
+        let xml = save_design_xml(&design, &XmlWriteContext::default()).expect("physical xml");
+        let doc = roxmltree::Document::parse(&xml).expect("parse xml");
+
+        assert!(doc.descendants().any(|node| {
+            node.has_tag_name("instance")
+                && node.attribute("name") == Some("uart_rx")
+                && node.attribute("moduleRef") == Some("iob")
+        }));
+        assert!(doc.descendants().any(|node| {
+            node.has_tag_name("instance")
+                && node.attribute("name") == Some("uart_rx")
+                && node.children().any(|child| {
+                    child.has_tag_name("config")
+                        && child.attribute("name") == Some("IMUX")
+                        && child.attribute("value") == Some("#OFF")
+                })
+        }));
+        assert!(doc.descendants().any(|node| {
+            node.has_tag_name("instance")
+                && node.attribute("name") == Some("uart_rx")
+                && node.children().any(|child| {
+                    child.has_tag_name("config")
+                        && child.attribute("name") == Some("IOATTRBOX")
+                        && child.attribute("value") == Some("#OFF")
+                })
+        }));
+        assert!(
+            !doc.descendants().any(|node| {
+                node.has_tag_name("net") && node.attribute("name") == Some("uart_rx")
+            })
+        );
+    }
 }

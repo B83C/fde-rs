@@ -24,6 +24,8 @@ pub use net::NetOrigin;
 pub use pin::PinRole;
 pub use primitive::{ConstantKind, PrimitiveKind};
 #[cfg(test)]
+pub(crate) use routing::is_block_ram_clock_sink_wire_name;
+#[cfg(test)]
 pub(crate) use routing::parse_canonical_indexed_wire;
 pub(crate) use routing::{
     CanonicalWireFamily, WireNameMetadata, should_skip_site_local_route_arc, wire_name_metadata,
@@ -36,6 +38,6 @@ pub use routing::{
     slice_lut_input_wire_prefix, slice_lut_output_wire_name, slice_output_wire_kind,
     slice_register_data_wire_name, slice_register_output_wire_name,
 };
-pub use sequential::SequentialInitValue;
-pub use site::SiteKind;
+pub use sequential::{SequentialCellType, SequentialInitValue};
+pub use site::{SiteKind, SliceSequentialConfigKey, SliceSlot};
 pub use timing::TimingPathCategory;

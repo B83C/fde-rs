@@ -20,6 +20,7 @@ pub(crate) struct WireNameMetadata {
     dedicated_clock: bool,
     clock_distribution: bool,
     clock_sink: bool,
+    block_ram_clock_sink: bool,
     pad_stub: bool,
     hex_like: bool,
     long: bool,
@@ -41,6 +42,10 @@ impl WireNameMetadata {
 
     pub(crate) fn is_clock_sink(self) -> bool {
         self.clock_sink
+    }
+
+    pub(crate) fn is_block_ram_clock_sink(self) -> bool {
+        self.block_ram_clock_sink
     }
 
     pub(crate) fn is_pad_stub(self) -> bool {
@@ -140,6 +145,7 @@ pub(crate) fn wire_name_metadata(raw: &str) -> WireNameMetadata {
         dedicated_clock: is_dedicated_clock_wire_name(raw),
         clock_distribution: is_clock_distribution_wire_name(raw),
         clock_sink: is_clock_sink_wire_name(raw),
+        block_ram_clock_sink: is_block_ram_clock_sink_wire_name(raw),
         pad_stub: is_pad_stub_wire_name(raw),
         hex_like: is_hex_like_wire_name(raw),
         long: is_long_wire_name(raw),
@@ -156,7 +162,11 @@ pub fn is_clock_distribution_wire_name(raw: &str) -> bool {
 }
 
 pub fn is_clock_sink_wire_name(raw: &str) -> bool {
-    raw.ends_with("_CLK_B")
+    raw.ends_with("_CLK_B") || is_block_ram_clock_sink_wire_name(raw)
+}
+
+pub(crate) fn is_block_ram_clock_sink_wire_name(raw: &str) -> bool {
+    raw.eq_ignore_ascii_case("BRAM_CLKA") || raw.eq_ignore_ascii_case("BRAM_CLKB")
 }
 
 pub fn is_pad_stub_wire_name(raw: &str) -> bool {
@@ -296,6 +306,8 @@ mod tests {
         assert!(is_dedicated_clock_wire_name("CLKB_GCLK0"));
         assert!(is_clock_distribution_wire_name("CLKV_VGCLK0"));
         assert!(is_clock_sink_wire_name("S0_CLK_B"));
+        assert!(is_clock_sink_wire_name("BRAM_CLKA"));
+        assert!(is_clock_sink_wire_name("BRAM_CLKB"));
         assert!(is_hex_like_wire_name("H6W6"));
         assert!(is_long_wire_name("LEFT_LLH3"));
         assert!(is_directional_channel_wire_name("N8"));
@@ -341,6 +353,11 @@ mod tests {
         assert_eq!(metadata.family(), None);
         assert!(metadata.is_hex_like());
         assert!(!metadata.is_clock_sink());
+
+        let metadata = wire_name_metadata("BRAM_CLKA");
+        assert!(metadata.is_clock_sink());
+        assert!(metadata.is_block_ram_clock_sink());
+        assert!(!metadata.is_clock_distribution());
     }
 
     #[test]

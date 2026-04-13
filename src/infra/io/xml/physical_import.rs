@@ -2,10 +2,16 @@ mod support;
 
 use super::{
     helpers::{attr, expand_bus_port_names, parse_point, top_module_node},
-    lut_expr::decode_lut_function,
+    lut_expr::{
+        PHYSICAL_LUT_FUNCTION_PROPERTY, decode_lut_function, preserved_physical_lut_function,
+    },
+};
+use crate::domain::{
+    BlockRamKind, BlockRamPin, SequentialInitValue, SliceSequentialConfigKey, SliceSlot,
 };
 use crate::ir::{
-    Cell, Cluster, Design, Endpoint, Net, Port, PortDirection, RoutePip, SliceBindingKind,
+    Cell, CellKind, Cluster, ClusterKind, Design, Endpoint, Net, Port, PortDirection, Property,
+    RoutePip, SliceBindingKind,
 };
 use anyhow::{Result, anyhow};
 use roxmltree::Node;
@@ -60,7 +66,10 @@ pub(super) fn load_fde_physical_design_xml(root: Node<'_, '_>) -> Result<Design>
     let clock_buffer_ports = clock_buffer_ports(&contents, &port_names);
     let clock_bridge_pips = clock_bridge_route_pips(&contents, &clock_buffer_ports);
     apply_port_positions(&mut ports, &instances_by_name);
-    let (clusters, mut cells, slice_states) = import_slice_clusters(&instances);
+    let (mut clusters, mut cells, slice_states) = import_slice_clusters(&instances);
+    let (mut block_ram_clusters, mut block_ram_cells) = import_block_ram_clusters(&instances);
+    clusters.append(&mut block_ram_clusters);
+    cells.append(&mut block_ram_cells);
     let mut nets = import_physical_nets(
         &contents,
         &port_names,
@@ -145,6 +154,60 @@ fn import_slice_clusters(
         slice_instance_sort_key(&lhs.name).cmp(&slice_instance_sort_key(&rhs.name))
     });
     (clusters, cells, slice_states)
+}
+
+fn import_block_ram_clusters(instances: &[PhysicalInstance]) -> (Vec<Cluster>, Vec<Cell>) {
+    let mut clusters = Vec::new();
+    let mut cells = Vec::new();
+    for instance in instances
+        .iter()
+        .filter(|instance| instance.module_ref == "blockram")
+    {
+        let kind = infer_block_ram_kind(instance);
+        let mut cell = Cell::new(
+            instance.name.clone(),
+            CellKind::BlockRam,
+            kind.canonical_type_name(),
+        )
+        .in_cluster(&instance.name);
+        for Property { key, value } in block_ram_properties(instance) {
+            cell.set_property(key, value);
+        }
+        cells.push(cell);
+
+        let mut cluster = Cluster::new(&instance.name, ClusterKind::BlockRam)
+            .with_member(&instance.name)
+            .with_capacity(1);
+        if let Some((x, y, z)) = instance.position {
+            cluster = cluster.fixed_at_slot(x, y, z);
+        }
+        clusters.push(cluster);
+    }
+    (clusters, cells)
+}
+
+fn infer_block_ram_kind(instance: &PhysicalInstance) -> BlockRamKind {
+    if ["CLKBMUX", "ENBMUX", "WEBMUX", "RSTBMUX", "PORTB_ATTR"]
+        .into_iter()
+        .any(|key| {
+            instance
+                .configs
+                .get(key)
+                .is_some_and(|value| value != "#OFF")
+        })
+    {
+        BlockRamKind::DualPort
+    } else {
+        BlockRamKind::SinglePort
+    }
+}
+
+fn block_ram_properties(instance: &PhysicalInstance) -> Vec<Property> {
+    instance
+        .configs
+        .iter()
+        .map(|(key, value)| Property::new(key.clone(), value.clone()))
+        .collect()
 }
 
 fn import_physical_nets(
@@ -395,24 +458,32 @@ fn build_slice_cluster(instance: &PhysicalInstance) -> (Cluster, Vec<Cell>, Slic
         ..Default::default()
     };
 
-    for slot in 0..2 {
-        let cfg_name = if slot == 0 { "F" } else { "G" };
+    for slot in SliceSlot::ALL {
+        let slot_index = slot.index();
+        let cfg_name = slot.lut_config_name();
         if let Some((lut_init, input_count)) = instance
             .configs
             .get(cfg_name)
             .and_then(|value| decode_lut_function(value))
         {
-            let lut_name = format!("{}::lut{slot}", instance.name);
+            let lut_name = format!("{}::lut{slot_index}", instance.name);
             let mut lut = Cell::lut(&lut_name, format!("LUT{input_count}"))
                 .in_cluster(&instance.name)
-                .with_slice_binding(slot, SliceBindingKind::Lut);
+                .with_slice_binding(slot_index, SliceBindingKind::Lut);
             lut.set_property("lut_init", lut_init);
+            if let Some(raw_function) = instance
+                .configs
+                .get(cfg_name)
+                .and_then(|value| preserved_physical_lut_function(value))
+            {
+                lut.set_property(PHYSICAL_LUT_FUNCTION_PROPERTY, raw_function);
+            }
             members.push(lut_name.clone());
-            state.slots[slot].lut_name = Some(lut_name);
+            state.slots[slot_index].lut_name = Some(lut_name);
             cells.push(lut);
         }
 
-        let ff_cfg_name = if slot == 0 { "FFX" } else { "FFY" };
+        let ff_cfg_name = slot.ff_config_name();
         if instance
             .configs
             .get(ff_cfg_name)
@@ -420,29 +491,50 @@ fn build_slice_cluster(instance: &PhysicalInstance) -> (Cluster, Vec<Cell>, Slic
         {
             continue;
         }
-        let ff_name = format!("{}::ff{slot}", instance.name);
-        let ff = Cell::ff(&ff_name, "DFFHQ")
+        let ff_name = format!("{}::ff{slot_index}", instance.name);
+        let mut ff = Cell::ff(&ff_name, "DFFHQ")
             .in_cluster(&instance.name)
-            .with_slice_binding(slot, SliceBindingKind::Sequential);
+            .with_slice_binding(slot_index, SliceBindingKind::Sequential);
+        if let Some(value) = instance.configs.get(slot.init_config_name())
+            && let Some(init) = SequentialInitValue::parse(value)
+        {
+            ff.set_property(
+                "init",
+                match init {
+                    SequentialInitValue::Low => "0",
+                    SequentialInitValue::High => "1",
+                },
+            );
+        }
+        for config_key in [
+            SliceSequentialConfigKey::ClockInvert,
+            SliceSequentialConfigKey::ClockEnableMux,
+            SliceSequentialConfigKey::SyncAttr,
+            SliceSequentialConfigKey::SetResetMux,
+            SliceSequentialConfigKey::SetResetFfMux,
+        ] {
+            if let Some(value) = instance.configs.get(config_key.as_str()) {
+                ff.set_property(config_key.as_str(), value);
+            }
+        }
         members.push(ff_name.clone());
-        state.slots[slot].ff_name = Some(ff_name);
-        state.slots[slot].ff_clock_pin = if instance
+        state.slots[slot_index].ff_name = Some(ff_name);
+        state.slots[slot_index].ff_clock_pin = if instance
             .configs
-            .get("CKINV")
+            .get(SliceSequentialConfigKey::ClockInvert.as_str())
             .is_some_and(|value| value == "1")
         {
             "CKN".to_string()
         } else {
             "CK".to_string()
         };
-        state.slots[slot].ff_has_clock_enable = instance
+        state.slots[slot_index].ff_has_clock_enable = instance
             .configs
-            .get("CEMUX")
+            .get(SliceSequentialConfigKey::ClockEnableMux.as_str())
             .is_some_and(|value| value.eq_ignore_ascii_case("CE"));
-        let d_cfg_name = if slot == 0 { "DXMUX" } else { "DYMUX" };
-        state.slots[slot].ff_uses_local_lut = instance
+        state.slots[slot_index].ff_uses_local_lut = instance
             .configs
-            .get(d_cfg_name)
+            .get(slot.data_mux_config_name())
             .is_none_or(|value| value == "1");
         cells.push(ff);
     }
@@ -469,6 +561,7 @@ fn physical_logical_endpoints(
     };
     match instance.module_ref.as_str() {
         "slice" => slice_logical_endpoints(instance_name, pin, slice_states),
+        "blockram" => block_ram_logical_endpoints(instance, pin),
         "iob" => port_logical_endpoints(instance_name, pin, ports),
         "gclk" => clock_buffer_ports
             .get(instance_name)
@@ -483,6 +576,51 @@ fn physical_logical_endpoints(
         "gclkiob" => Vec::new(),
         _ => Vec::new(),
     }
+}
+
+fn block_ram_logical_endpoints(
+    instance: &PhysicalInstance,
+    pin: &str,
+) -> Vec<(Endpoint, PhysicalEndpointRole)> {
+    let Some(pin) = normalize_block_ram_pin(pin) else {
+        return Vec::new();
+    };
+    let Some(parsed) = BlockRamPin::parse(&pin) else {
+        return Vec::new();
+    };
+    let role = match parsed {
+        BlockRamPin::DataOut { .. } => PhysicalEndpointRole::Driver,
+        BlockRamPin::Control { .. } | BlockRamPin::DataIn { .. } | BlockRamPin::Addr { .. } => {
+            PhysicalEndpointRole::Sink
+        }
+    };
+    vec![(Endpoint::cell(instance.name.clone(), pin), role)]
+}
+
+fn normalize_block_ram_pin(pin: &str) -> Option<String> {
+    let compact = pin
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect::<String>();
+    if compact.is_empty() {
+        return None;
+    }
+
+    let canonical = if let Some(suffix) = compact.strip_prefix("DOUTA") {
+        format!("DOA{suffix}")
+    } else if let Some(suffix) = compact.strip_prefix("DOUTB") {
+        format!("DOB{suffix}")
+    } else if let Some(suffix) = compact.strip_prefix("DINA") {
+        format!("DIA{suffix}")
+    } else if let Some(suffix) = compact.strip_prefix("DINB") {
+        format!("DIB{suffix}")
+    } else {
+        compact
+    };
+
+    BlockRamPin::parse(&canonical).map(|_| canonical)
 }
 
 fn slice_logical_endpoints(

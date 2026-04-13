@@ -5,6 +5,7 @@ use std::path::Path;
 use super::{
     CIL_PROPERTY, DesignXmlWriter, GCLK_PORTS, GCLKIOB_PORTS, IOB_PORTS, PHYSICAL_EXTERNAL_LIB,
     PhysicalDesignView, PhysicalInstance, PhysicalNet, SLICE_PORTS, WORK_LIB, XmlWriteContext,
+    blockram_ports,
 };
 use crate::ir::Design;
 
@@ -45,25 +46,63 @@ impl DesignXmlWriter {
         let mut lib = BytesStart::new("external");
         lib.push_attribute(("name", PHYSICAL_EXTERNAL_LIB));
         self.start_element(lib)?;
-        for (name, module_type, ports) in [
-            ("slice", "SLICE", SLICE_PORTS),
-            ("iob", "IOB", IOB_PORTS),
-            ("gclk", "GCLK", GCLK_PORTS),
-            ("gclkiob", "GCLKIOB", GCLKIOB_PORTS),
-        ] {
-            if !used_modules.contains(name) {
-                continue;
-            }
-            let mut module = BytesStart::new("module");
-            module.push_attribute(("name", name));
-            module.push_attribute(("type", module_type));
-            self.start_element(module)?;
-            for port in ports {
-                self.write_xml_port(port.name, port.direction, 1, include_capacitance, &[])?;
-            }
-            self.end_element("module")?;
-        }
+        self.write_physical_external_module(
+            include_capacitance,
+            used_modules,
+            "blockram",
+            "BLOCKRAM",
+            &blockram_ports(),
+        )?;
+        self.write_physical_external_module(
+            include_capacitance,
+            used_modules,
+            "slice",
+            "SLICE",
+            SLICE_PORTS,
+        )?;
+        self.write_physical_external_module(
+            include_capacitance,
+            used_modules,
+            "iob",
+            "IOB",
+            IOB_PORTS,
+        )?;
+        self.write_physical_external_module(
+            include_capacitance,
+            used_modules,
+            "gclk",
+            "GCLK",
+            GCLK_PORTS,
+        )?;
+        self.write_physical_external_module(
+            include_capacitance,
+            used_modules,
+            "gclkiob",
+            "GCLKIOB",
+            GCLKIOB_PORTS,
+        )?;
         self.end_element("external")
+    }
+
+    fn write_physical_external_module(
+        &mut self,
+        include_capacitance: bool,
+        used_modules: &std::collections::BTreeSet<&'static str>,
+        name: &'static str,
+        module_type: &'static str,
+        ports: &[super::PhysicalPortDesc],
+    ) -> Result<()> {
+        if !used_modules.contains(name) {
+            return Ok(());
+        }
+        let mut module = BytesStart::new("module");
+        module.push_attribute(("name", name));
+        module.push_attribute(("type", module_type));
+        self.start_element(module)?;
+        for port in ports {
+            self.write_xml_port(&port.name, port.direction, 1, include_capacitance, &[])?;
+        }
+        self.end_element("module")
     }
 
     fn write_physical_work_library(

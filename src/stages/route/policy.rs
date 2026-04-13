@@ -8,9 +8,9 @@ use crate::{
 #[cfg(test)]
 use crate::{
     domain::{
-        is_clock_distribution_wire_name, is_clock_sink_wire_name, is_directional_channel_wire_name,
-        is_hex_like_wire_name, is_long_wire_name, is_pad_stub_wire_name,
-        should_skip_site_local_route_arc,
+        is_block_ram_clock_sink_wire_name, is_clock_distribution_wire_name,
+        is_clock_sink_wire_name, is_directional_channel_wire_name, is_hex_like_wire_name,
+        is_long_wire_name, is_pad_stub_wire_name, should_skip_site_local_route_arc,
     },
     route::types::{SiteRouteArc, WireInterner},
 };
@@ -140,7 +140,8 @@ pub(super) fn allow_clock_neighbor(
     }
 
     if is_clock_sink_wire_name(next_name) {
-        return true;
+        return !is_block_ram_clock_sink_wire_name(next_name)
+            || crate::domain::is_dedicated_clock_wire_name(current_name);
     }
 
     is_clock_route_wire_name(next_name)
@@ -161,7 +162,7 @@ fn allow_clock_neighbor_metadata(
     }
 
     if next.is_clock_sink() {
-        return true;
+        return !next.is_block_ram_clock_sink() || current.is_dedicated_clock();
     }
 
     is_clock_route_wire_metadata(next)
@@ -309,6 +310,18 @@ mod tests {
             true,
             "E_P15",
             "S0_CLK_B",
+        ));
+        assert!(allow_clock_neighbor(
+            RouteNetKind::DedicatedClock,
+            true,
+            "BRAM_GCLKIN1",
+            "BRAM_CLKA",
+        ));
+        assert!(!allow_clock_neighbor(
+            RouteNetKind::DedicatedClock,
+            true,
+            "BRAM_LLV6",
+            "BRAM_CLKA",
         ));
         assert!(!allow_clock_neighbor(
             RouteNetKind::DedicatedClock,

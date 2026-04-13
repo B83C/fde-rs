@@ -297,3 +297,74 @@ fn resolves_renamed_array_ports_using_member_ordinals() {
         Some("bus[1]")
     );
 }
+
+#[test]
+fn resolves_instance_port_array_members_using_library_port_order() {
+    let design = parse_source(
+        r#"
+            (edif top
+              (external LIB
+                (cell RAMB4_S8
+                  (cellType GENERIC)
+                  (view VIEW_NETLIST
+                    (viewType NETLIST)
+                    (interface
+                      (port (array DI 8) (direction INPUT))
+                      (port (array DO 8) (direction OUTPUT))
+                      (port (array ADDR 12) (direction INPUT))))))
+              (library DESIGN
+                (cell top
+                  (view NETLIST
+                    (interface
+                      (port din0 (direction INPUT))
+                      (port dout0 (direction OUTPUT))
+                      (port addr0 (direction INPUT)))
+                    (contents
+                      (instance mem0
+                        (viewRef NETLIST (cellRef RAMB4_S8 (libraryRef LIB))))
+                      (net n_din0
+                        (joined
+                          (portRef din0)
+                          (portRef (member DI 7) (instanceRef mem0))))
+                      (net n_dout0
+                        (joined
+                          (portRef (member DO 7) (instanceRef mem0))
+                          (portRef dout0)))
+                      (net n_addr0
+                        (joined
+                          (portRef addr0)
+                          (portRef (member ADDR 8) (instanceRef mem0)))))))))
+            "#,
+    )
+    .expect("parse instance array members");
+
+    let n_din0 = design
+        .nets
+        .iter()
+        .find(|net| net.name == "n_din0")
+        .expect("n_din0");
+    assert_eq!(
+        n_din0.sinks.first().map(|sink| sink.pin.as_str()),
+        Some("DI[0]")
+    );
+
+    let n_dout0 = design
+        .nets
+        .iter()
+        .find(|net| net.name == "n_dout0")
+        .expect("n_dout0");
+    assert_eq!(
+        n_dout0.driver.as_ref().map(|driver| driver.pin.as_str()),
+        Some("DO[0]")
+    );
+
+    let n_addr0 = design
+        .nets
+        .iter()
+        .find(|net| net.name == "n_addr0")
+        .expect("n_addr0");
+    assert_eq!(
+        n_addr0.sinks.first().map(|sink| sink.pin.as_str()),
+        Some("ADDR[3]")
+    );
+}

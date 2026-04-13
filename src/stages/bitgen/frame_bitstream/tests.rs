@@ -3,11 +3,17 @@ use std::{collections::BTreeMap, fs};
 
 use tempfile::NamedTempFile;
 
-use super::{decode::decode_text_bitstream, layout::build_tile_columns, serialize_text_bitstream};
+use super::{
+    decode::decode_text_bitstream, encode::build_major_payloads, layout::build_tile_columns,
+    serialize_text_bitstream,
+};
 use crate::{
     bitgen::{ConfigImage, TileBitAssignment, TileConfigImage},
-    cil::parse_cil_str,
-    resource::{Arch, TileInstance},
+    build_config_image,
+    cil::{load_cil, parse_cil_str},
+    io::load_design,
+    load_arch, lower_design,
+    resource::{Arch, TileInstance, routing},
 };
 
 #[test]
@@ -202,4 +208,117 @@ fn roundtrips_text_bitstream_back_into_tile_columns() {
     let decoded =
         decode_text_bitstream(&arch, &cil, &serialized.text).expect("decode text bitstream");
     assert_eq!(decoded, expected);
+}
+
+#[test]
+#[ignore = "debug helper for actual frame bitstream mismatch tracing"]
+fn debug_actual_bram_frame_columns() {
+    use std::path::PathBuf;
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn tile_bit(tile: &super::model::TileFrameImage, row: usize, col: usize) -> u8 {
+        tile.bits[row * tile.cols + col]
+    }
+
+    fn find_tile<'a>(
+        columns: &'a std::collections::BTreeMap<usize, Vec<super::model::TileFrameImage>>,
+        bit_y: usize,
+        bit_x: usize,
+        tile_name: &str,
+    ) -> &'a super::model::TileFrameImage {
+        columns[&bit_y]
+            .iter()
+            .find(|tile| tile.tile_name == tile_name && tile.bit_x == bit_x)
+            .expect("tile present")
+    }
+
+    let root = repo_root();
+    let arch = load_arch(&root.join("resources/hw_lib/fdp3p7_arch.xml")).expect("load arch");
+    let cil = load_cil(&root.join("resources/hw_lib/fdp3p7_cil.xml")).expect("load cil");
+    let design =
+        load_design(&root.join("build/bram_cpp_yosys/04-routed.xml")).expect("load routed");
+    let arch_path = root.join("resources/hw_lib/fdp3p7_arch.xml");
+    let lowered = lower_design(design, &arch, Some(&cil), &[]).expect("lower routed");
+    let config_image = build_config_image(&lowered, &cil, Some(&arch), None).expect("config image");
+    let transmission_defaults =
+        routing::load_site_route_defaults(&arch_path, &cil).expect("load transmission defaults");
+
+    let mut notes = Vec::new();
+    let layout = build_tile_columns(
+        &arch,
+        &cil,
+        &config_image,
+        &transmission_defaults,
+        &mut notes,
+    );
+    assert!(notes.is_empty(), "layout notes: {notes:#?}");
+
+    let cpp_text = fs::read_to_string(root.join("build/bram_cpp_yosys/06-output.bit"))
+        .expect("read cpp bitstream");
+    let rust_text =
+        fs::read_to_string(root.join("build/bram_mix_rust_bitgen_after_constfix/06-output.bit"))
+            .expect("read rust bitstream");
+    let cpp = decode_text_bitstream(&arch, &cil, &cpp_text).expect("decode cpp bitstream");
+    let rust = decode_text_bitstream(&arch, &cil, &rust_text).expect("decode rust bitstream");
+    let payloads = build_major_payloads(&cil, &layout).expect("build major payloads");
+
+    let major_payload = |tile_col: usize| {
+        payloads
+            .iter()
+            .find(|payload| {
+                cil.majors
+                    .iter()
+                    .find(|major| major.address == payload.address)
+                    .is_some_and(|major| major.tile_col == tile_col)
+            })
+            .expect("major payload")
+    };
+
+    for (tile_name, bit_y, bit_x, bits) in [
+        ("R24C1", 2usize, 25usize, &[(4usize, 12usize), (4, 22)][..]),
+        (
+            "R2C32",
+            35usize,
+            2usize,
+            &[(4usize, 12usize), (4, 22), (4, 25), (4, 35)][..],
+        ),
+        (
+            "R31C3",
+            4usize,
+            32usize,
+            &[(4usize, 12usize), (4, 22), (4, 25), (4, 35)][..],
+        ),
+    ] {
+        let layout_tile = find_tile(&layout, bit_y, bit_x, tile_name);
+        let cpp_tile = find_tile(&cpp, bit_y, bit_x, tile_name);
+        let rust_tile = find_tile(&rust, bit_y, bit_x, tile_name);
+
+        println!("tile {tile_name}");
+        for (row, col) in bits {
+            println!(
+                "  B{row}W{col}: layout={} cpp={} rust={}",
+                tile_bit(layout_tile, *row, *col),
+                tile_bit(cpp_tile, *row, *col),
+                tile_bit(rust_tile, *row, *col),
+            );
+        }
+    }
+
+    for tile_col in [2usize, 4usize, 35usize] {
+        let payload = major_payload(tile_col);
+        println!("major tile_col={tile_col} addr={}", payload.address);
+        for (word_index, word) in payload.words.iter().enumerate().filter(|(index, _)| {
+            matches!(
+                (tile_col, *index),
+                (2, 254 | 454 | 515 | 715)
+                    | (4, 257 | 457 | 513 | 517 | 713 | 717)
+                    | (35, 242 | 442 | 502 | 702)
+            )
+        }) {
+            println!("  payload[{word_index}]={word:#010x}");
+        }
+    }
 }

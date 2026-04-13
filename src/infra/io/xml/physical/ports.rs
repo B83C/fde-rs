@@ -18,6 +18,8 @@ pub(super) fn build_port_bindings(
         .iter()
         .map(|port| {
             let clock_input = is_clock_input_port(design, &port.name);
+            let input_used = port_used_as_input(design, &port.name);
+            let output_used = port_used_as_output(design, &port.name);
             let pin_name = port.pin.as_deref().or_else(|| {
                 context
                     ._constraints
@@ -52,7 +54,8 @@ pub(super) fn build_port_bindings(
             let tile_position = pad.map(|pad| (pad.x, pad.y, pad.z)).or(fallback_position);
             PortInstanceBinding {
                 port_name: port.name.clone(),
-                direction: port.direction.clone(),
+                input_used,
+                output_used,
                 pad_instance_name: port.name.clone(),
                 pad_module_ref,
                 pad_position,
@@ -71,19 +74,38 @@ pub(super) fn build_pad_configs(binding: &PortInstanceBinding) -> Vec<(String, S
         "gclkiob" => default_configs(GCLKIOB_DEFAULT_CONFIGS),
         "iob" => {
             let mut configs = default_config_map(IOB_DEFAULT_CONFIGS);
-            if binding.direction.is_input_like() {
+            if binding.input_used {
                 configs.insert("IMUX".to_string(), "1".to_string());
             }
-            if binding.direction.is_output_like() {
+            if binding.output_used {
                 configs.insert("OMUX".to_string(), "O".to_string());
                 configs.insert("OUTMUX".to_string(), "1".to_string());
                 configs.insert("DRIVEATTRBOX".to_string(), "12".to_string());
                 configs.insert("SLEW".to_string(), "SLOW".to_string());
             }
+            if !(binding.input_used || binding.output_used) {
+                configs.insert("IOATTRBOX".to_string(), "#OFF".to_string());
+            }
             ordered_configs(IOB_DEFAULT_CONFIGS, configs)
         }
         _ => Vec::new(),
     }
+}
+
+fn port_used_as_input(design: &Design, port_name: &str) -> bool {
+    design.nets.iter().any(|net| {
+        net.driver.as_ref().is_some_and(|driver| {
+            driver.kind == crate::domain::EndpointKind::Port && driver.name == port_name
+        })
+    })
+}
+
+fn port_used_as_output(design: &Design, port_name: &str) -> bool {
+    design.nets.iter().any(|net| {
+        net.sinks
+            .iter()
+            .any(|sink| sink.kind == crate::domain::EndpointKind::Port && sink.name == port_name)
+    })
 }
 
 fn gclk_input_pips(binding: &PortInstanceBinding) -> Vec<RoutePip> {
@@ -123,8 +145,8 @@ pub(super) fn split_clock_route_pips(
 
 #[cfg(test)]
 mod tests {
-    use super::build_port_bindings;
-    use crate::ir::{Design, Port};
+    use super::{build_pad_configs, build_port_bindings};
+    use crate::ir::{Design, Endpoint, Net, Port};
 
     #[test]
     fn fallback_port_binding_preserves_existing_site_slot() {
@@ -139,5 +161,44 @@ mod tests {
 
         assert_eq!(binding.pad_position, Some((5, 1, 2)));
         assert_eq!(binding.tile_position, Some((5, 1, 2)));
+    }
+
+    #[test]
+    fn unused_input_port_keeps_iob_disabled() {
+        let design = Design {
+            stage: "placed".to_string(),
+            ports: vec![
+                Port::input("din").at_site(1, 1, 0),
+                Port::input("uart_rx").at_site(2, 1, 0),
+                Port::output("dout").at_site(3, 1, 0),
+            ],
+            nets: vec![
+                Net::new("data")
+                    .with_driver(Endpoint::port("din", "din"))
+                    .with_sink(Endpoint::port("dout", "dout")),
+            ],
+            ..Design::default()
+        };
+
+        let bindings = build_port_bindings(&design, &Default::default());
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.port_name == "uart_rx")
+            .expect("unused uart_rx binding");
+
+        assert!(!binding.input_used);
+        assert!(!binding.output_used);
+
+        let configs = build_pad_configs(binding);
+        assert!(
+            configs
+                .iter()
+                .any(|(name, value)| name == "IMUX" && value == "#OFF")
+        );
+        assert!(
+            configs
+                .iter()
+                .any(|(name, value)| name == "IOATTRBOX" && value == "#OFF")
+        );
     }
 }

@@ -4,12 +4,13 @@ use super::derive::derive_site_programs;
 use super::types::{
     BlockRamProgram, IobProgram, LutProgram, ProgrammedMemory, ProgrammedSite, ProgrammingImage,
     RequestedConfig, SequentialProgram, SiteProgram, SiteProgramKind, SliceClockEnableMode,
-    SliceFfDataPath, SliceLutOutputUsage, SliceProgram,
+    SliceFfDataPath, SliceLutOutputUsage, SliceProgram, SliceSetResetMode,
 };
 use crate::{
     bitgen::DeviceDesign,
     bitgen::{DeviceDesignIndex, literal::address_count},
     cil::{Cil, SiteDef},
+    domain::{SliceSequentialConfigKey, SliceSlot},
     route::DeviceRouteImage,
 };
 
@@ -93,26 +94,27 @@ fn emit_site_requests(site: &SiteProgram, site_def: &SiteDef) -> Vec<RequestedCo
 fn emit_slice_requests(program: &SliceProgram, site_def: &SiteDef) -> Vec<RequestedConfig> {
     let mut requests = Vec::new();
 
-    for slot in 0..2 {
-        if let Some(lut) = &program.slots[slot].lut
+    for slot in SliceSlot::ALL {
+        let slot_index = slot.index();
+        if let Some(lut) = &program.slots[slot_index].lut
             && let Some(function_name) = encode_lut_function_name(lut, site_def, slot)
         {
             requests.push(RequestedConfig {
-                cfg_name: if slot == 0 { "F" } else { "G" }.to_string(),
+                cfg_name: slot.lut_config_name().to_string(),
                 function_name,
             });
             requests.push(RequestedConfig {
-                cfg_name: if slot == 0 { "FXMUX" } else { "GYMUX" }.to_string(),
-                function_name: if slot == 0 { "F" } else { "G" }.to_string(),
+                cfg_name: slot.lut_mux_config_name().to_string(),
+                function_name: slot.lut_config_name().to_string(),
             });
         }
-        if let Some(ff) = &program.slots[slot].ff {
+        if let Some(ff) = &program.slots[slot_index].ff {
             requests.push(RequestedConfig {
-                cfg_name: if slot == 0 { "FFX" } else { "FFY" }.to_string(),
+                cfg_name: slot.ff_config_name().to_string(),
                 function_name: "#FF".to_string(),
             });
             requests.push(RequestedConfig {
-                cfg_name: if slot == 0 { "INITX" } else { "INITY" }.to_string(),
+                cfg_name: slot.init_config_name().to_string(),
                 function_name: ff.init.as_config_value().to_string(),
             });
             requests.extend(slice_ff_data_requests(ff, slot));
@@ -123,7 +125,7 @@ fn emit_slice_requests(program: &SliceProgram, site_def: &SiteDef) -> Vec<Reques
         && matches!(lut.output_usage, SliceLutOutputUsage::RoutedOutput)
     {
         requests.push(RequestedConfig {
-            cfg_name: "XUSED".to_string(),
+            cfg_name: SliceSlot::X.lut_used_config_name().to_string(),
             function_name: "0".to_string(),
         });
     }
@@ -131,26 +133,38 @@ fn emit_slice_requests(program: &SliceProgram, site_def: &SiteDef) -> Vec<Reques
         && matches!(lut.output_usage, SliceLutOutputUsage::RoutedOutput)
     {
         requests.push(RequestedConfig {
-            cfg_name: "YUSED".to_string(),
+            cfg_name: SliceSlot::Y.lut_used_config_name().to_string(),
             function_name: "0".to_string(),
         });
     }
 
     if program.has_sequential() {
         requests.push(RequestedConfig {
-            cfg_name: "CKINV".to_string(),
+            cfg_name: SliceSequentialConfigKey::ClockInvert.as_str().to_string(),
             function_name: "1".to_string(),
         });
         if program.clock_enable_mode == SliceClockEnableMode::DirectCe {
             requests.push(RequestedConfig {
-                cfg_name: "CEMUX".to_string(),
+                cfg_name: SliceSequentialConfigKey::ClockEnableMux
+                    .as_str()
+                    .to_string(),
                 function_name: "CE".to_string(),
             });
         }
         requests.push(RequestedConfig {
-            cfg_name: "SYNC_ATTR".to_string(),
+            cfg_name: SliceSequentialConfigKey::SyncAttr.as_str().to_string(),
             function_name: "ASYNC".to_string(),
         });
+        if program.set_reset_mode == SliceSetResetMode::ActiveLowShared {
+            requests.push(RequestedConfig {
+                cfg_name: SliceSequentialConfigKey::SetResetMux.as_str().to_string(),
+                function_name: "SR_B".to_string(),
+            });
+            requests.push(RequestedConfig {
+                cfg_name: SliceSequentialConfigKey::SetResetFfMux.as_str().to_string(),
+                function_name: "0".to_string(),
+            });
+        }
     }
 
     dedup_requests(requests)
@@ -233,31 +247,31 @@ fn emit_block_ram_requests(program: &BlockRamProgram, site_def: &SiteDef) -> Vec
     dedup_requests(requests)
 }
 
-fn slice_ff_data_requests(ff: &SequentialProgram, slot: usize) -> Vec<RequestedConfig> {
-    let d_cfg = if slot == 0 { "DXMUX" } else { "DYMUX" };
-    let b_cfg = if slot == 0 { "BXMUX" } else { "BYMUX" };
-    let b_function = if slot == 0 { "BX" } else { "BY" };
+fn slice_ff_data_requests(ff: &SequentialProgram, slot: SliceSlot) -> Vec<RequestedConfig> {
     match ff.data_path {
         SliceFfDataPath::LocalLut => vec![RequestedConfig {
-            cfg_name: d_cfg.to_string(),
+            cfg_name: slot.data_mux_config_name().to_string(),
             function_name: "1".to_string(),
         }],
         SliceFfDataPath::SiteBypass => vec![
             RequestedConfig {
-                cfg_name: d_cfg.to_string(),
+                cfg_name: slot.data_mux_config_name().to_string(),
                 function_name: "0".to_string(),
             },
             RequestedConfig {
-                cfg_name: b_cfg.to_string(),
-                function_name: b_function.to_string(),
+                cfg_name: slot.bypass_mux_config_name().to_string(),
+                function_name: slot.bypass_function_name().to_string(),
             },
         ],
     }
 }
 
-fn encode_lut_function_name(lut: &LutProgram, site_def: &SiteDef, slot: usize) -> Option<String> {
-    let cfg_name = if slot == 0 { "F" } else { "G" };
-    let site_table_bits = site_truth_table_bits(site_def, cfg_name)?;
+fn encode_lut_function_name(
+    lut: &LutProgram,
+    site_def: &SiteDef,
+    slot: SliceSlot,
+) -> Option<String> {
+    let site_table_bits = site_truth_table_bits(site_def, slot.lut_config_name())?;
     let expanded_bits = expand_truth_table_bits(&lut.truth_table_bits, site_table_bits);
     Some(format_truth_table_literal(&expanded_bits))
 }

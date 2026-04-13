@@ -8,7 +8,8 @@ use quick_xml::events::{BytesDecl, BytesStart, Event};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    super::lut_expr::encode_lut_expression_literal, DesignXmlWriter, LOGICAL_EXTERNAL_LIB, WORK_LIB,
+    super::lut_expr::{PHYSICAL_LUT_FUNCTION_PROPERTY, encode_lut_expression_literal},
+    DesignXmlWriter, LOGICAL_EXTERNAL_LIB, WORK_LIB,
 };
 
 impl DesignXmlWriter {
@@ -604,6 +605,12 @@ pub(super) fn packed_lut_function_name(cell: &Cell) -> Option<String> {
     let bits = logical_lut_truth_table_bits(cell)?;
     let input_count = logical_lut_input_count(cell.primitive_kind())?;
     Some(encode_lut_expression_literal(&bits, input_count))
+}
+
+pub(super) fn physical_lut_function_name(cell: &Cell) -> Option<String> {
+    cell.property(PHYSICAL_LUT_FUNCTION_PROPERTY)
+        .map(str::to_owned)
+        .or_else(|| packed_lut_function_name(cell))
 }
 
 fn logical_lut_input_count(primitive: PrimitiveKind) -> Option<usize> {

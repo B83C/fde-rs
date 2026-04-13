@@ -187,6 +187,13 @@ fn assign_block_ram_clusters(design: &mut Design, arch: &Arch) -> Result<usize> 
     if available.is_empty() {
         bail!("design contains block RAM clusters, but architecture exposes no block RAM sites");
     }
+    if block_ram_clusters.len() > available.len() {
+        bail!(
+            "not enough block RAM sites: need {}, only {} available",
+            block_ram_clusters.len(),
+            available.len()
+        );
+    }
 
     for cluster in &mut block_ram_clusters {
         if let Some((x, y)) = cluster.x.zip(cluster.y) {
@@ -199,32 +206,8 @@ fn assign_block_ram_clusters(design: &mut Design, arch: &Arch) -> Result<usize> 
             if !used.insert((x, y)) {
                 bail!("multiple block RAM clusters request site ({x}, {y})");
             }
-            cluster.z = Some(0);
-            cluster.fixed = true;
+            cluster.z.get_or_insert(0);
         }
-    }
-
-    let mut remaining_sites = block_ram_sites
-        .into_iter()
-        .filter(|site| !used.contains(site))
-        .collect::<Vec<_>>();
-    remaining_sites.sort_unstable();
-    let mut next_site = remaining_sites.into_iter();
-    for cluster in &mut block_ram_clusters {
-        if cluster.x.is_some() && cluster.y.is_some() {
-            continue;
-        }
-        let Some((x, y)) = next_site.next() else {
-            bail!(
-                "not enough block RAM sites: need {}, only {} available",
-                block_ram_clusters.len(),
-                available.len()
-            );
-        };
-        cluster.x = Some(x);
-        cluster.y = Some(y);
-        cluster.z = Some(0);
-        cluster.fixed = true;
     }
 
     Ok(block_ram_clusters.len())

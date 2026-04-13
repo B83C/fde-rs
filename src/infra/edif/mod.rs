@@ -7,7 +7,7 @@ use crate::ir::{Design, Port, PortDirection};
 use anyhow::{Context, Result, anyhow, bail};
 use builder::{DesignBuilder, EndpointTarget, PendingEndpoint, PendingNet};
 use lexer::Token;
-use names::{ArraySpec, ParsedName};
+use names::{ArraySpec, ParsedMember, ParsedName, PortDecl};
 use std::{collections::BTreeMap, fs, path::Path};
 
 pub fn load_edif(path: &Path) -> Result<Design> {
@@ -123,10 +123,92 @@ impl<'a> Parser<'a> {
 
     fn parse_library_cell(&mut self, builder: &mut DesignBuilder) -> Result<()> {
         if let Some(name) = self.parse_name_expr()? {
-            builder.register_library_cell(name);
+            builder.register_library_cell(name.clone());
+            while !self.peek_is_rparen()? {
+                if self.peek_is_lparen()? {
+                    self.expect_lparen()?;
+                    let head = self.expect_atom()?;
+                    match head.as_str() {
+                        "view" => self.parse_library_cell_view(builder, &name.display)?,
+                        _ => self.skip_current_list()?,
+                    }
+                } else {
+                    self.skip_value()?;
+                }
+            }
+            return self.expect_rparen();
         }
         while !self.peek_is_rparen()? {
             self.skip_value()?;
+        }
+        self.expect_rparen()
+    }
+
+    fn parse_library_cell_view(
+        &mut self,
+        builder: &mut DesignBuilder,
+        cell_name: &str,
+    ) -> Result<()> {
+        let saved_port_arrays = std::mem::take(&mut self.current_port_arrays);
+        let _ = self.parse_name_expr()?;
+        while !self.peek_is_rparen()? {
+            if self.peek_is_lparen()? {
+                self.expect_lparen()?;
+                let head = self.expect_atom()?;
+                match head.as_str() {
+                    "interface" => self.parse_library_cell_interface(builder, cell_name)?,
+                    _ => self.skip_current_list()?,
+                }
+            } else {
+                self.skip_value()?;
+            }
+        }
+        self.expect_rparen()?;
+        self.current_port_arrays = saved_port_arrays;
+        Ok(())
+    }
+
+    fn parse_library_cell_interface(
+        &mut self,
+        builder: &mut DesignBuilder,
+        cell_name: &str,
+    ) -> Result<()> {
+        while !self.peek_is_rparen()? {
+            if self.peek_is_lparen()? {
+                self.expect_lparen()?;
+                let head = self.expect_atom()?;
+                match head.as_str() {
+                    "port" => self.parse_library_cell_port(builder, cell_name)?,
+                    _ => self.skip_current_list()?,
+                }
+            } else {
+                self.skip_value()?;
+            }
+        }
+        self.expect_rparen()
+    }
+
+    fn parse_library_cell_port(
+        &mut self,
+        builder: &mut DesignBuilder,
+        cell_name: &str,
+    ) -> Result<()> {
+        let decl = self.parse_port_decl_names()?;
+        register_library_cell_port_decl(builder, cell_name, &decl);
+
+        while !self.peek_is_rparen()? {
+            if self.peek_is_lparen()? {
+                self.expect_lparen()?;
+                let head = self.expect_atom()?;
+                match head.as_str() {
+                    "direction" => {
+                        let _ = self.parse_direction()?;
+                    }
+                    _ => self.skip_current_list()?,
+                }
+            } else {
+                self.skip_value()?;
+            }
         }
         self.expect_rparen()
     }
@@ -209,6 +291,12 @@ impl<'a> Parser<'a> {
         }
         self.expect_rparen()?;
         Ok(value.parse().unwrap_or(PortDirection::Input))
+    }
+}
+
+fn register_library_cell_port_decl(builder: &mut DesignBuilder, cell_name: &str, decl: &PortDecl) {
+    if let (Some(array_key), Some(array_spec)) = (&decl.array_key, &decl.array_spec) {
+        builder.register_library_cell_port_array(cell_name, array_key, array_spec.clone());
     }
 }
 

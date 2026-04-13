@@ -3,16 +3,21 @@ use super::{
     derive::derive_site_programs,
     types::{
         BlockRamProgram, RequestedConfig, SiteProgramKind, SliceClockEnableMode, SliceFfDataPath,
-        SliceLutOutputUsage,
+        SliceLutOutputUsage, SliceSetResetMode,
     },
 };
 use crate::{
     bitgen::DeviceDesignIndex,
     bitgen::{DeviceCell, DeviceDesign, DeviceEndpoint, DeviceNet},
+    build_config_image,
+    cil::load_cil,
     cil::parse_cil_str,
     domain::{CellKind, NetOrigin, SiteKind},
+    io::load_design,
     ir::Property,
+    load_arch, lower_design,
 };
+use std::path::PathBuf;
 
 fn logic_slice_program(device: &DeviceDesign) -> super::types::SliceProgram {
     let index = DeviceDesignIndex::build(device);
@@ -139,6 +144,56 @@ fn mini_block_ram_cil() -> &'static str {
           </site_library>
         </device>
         "##
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+#[test]
+#[ignore = "debug helper for physical XML bitgen request tracing"]
+fn debug_actual_routed_slice_requests() {
+    let root = repo_root();
+    let design =
+        load_design(&root.join("build/bram_cpp_yosys/04-routed.xml")).expect("load design");
+    let arch = load_arch(&root.join("resources/hw_lib/fdp3p7_arch.xml")).expect("load arch");
+    let cil = load_cil(&root.join("resources/hw_lib/fdp3p7_cil.xml")).expect("load cil");
+    let lowered = lower_design(design, &arch, Some(&cil), &[]).expect("lower design");
+    let programmed = build_programming_image(&lowered, &cil, None);
+    let image = build_config_image(&lowered, &cil, Some(&arch), None).expect("config image");
+
+    for site in programmed.sites.iter().filter(|site| {
+        site.tile_name == "R24C1" || site.tile_name == "R2C32" || site.tile_name == "R31C3"
+    }) {
+        println!(
+            "site {} {} {} {}",
+            site.tile_name, site.site_name, site.x, site.y
+        );
+        for request in &site.requests {
+            println!("  {}={}", request.cfg_name, request.function_name);
+        }
+    }
+    for tile in image.tiles.iter().filter(|tile| {
+        tile.tile_name == "R24C1" || tile.tile_name == "R2C32" || tile.tile_name == "R31C3"
+    }) {
+        println!("tile {} {} {}", tile.tile_name, tile.x, tile.y);
+        for cfg in &tile.configs {
+            println!(
+                "  cfg {} {}={}",
+                cfg.site_name, cfg.cfg_name, cfg.function_name
+            );
+        }
+        for bit in tile
+            .assignments
+            .iter()
+            .filter(|bit| bit.cfg_name == "SRMUX" || bit.cfg_name == "SRFFMUX")
+        {
+            println!(
+                "  bit {} {}={} -> B{}W{}",
+                bit.site_name, bit.cfg_name, bit.function_name, bit.row, bit.col
+            );
+        }
+    }
 }
 
 #[test]
@@ -297,6 +352,42 @@ fn detects_clock_enable_usage_in_site_program() {
 
     let slice = logic_slice_program(&device);
     assert_eq!(slice.clock_enable_mode, SliceClockEnableMode::DirectCe);
+}
+
+#[test]
+fn detects_shared_active_low_set_reset_usage_in_site_program() {
+    let ff0 = DeviceCell::new("ff0", CellKind::Ff, "DFFHQ").placed(
+        SiteKind::LogicSlice,
+        "S0",
+        "FF0",
+        "T0",
+        "CENTER",
+        (0, 0, 0),
+    );
+    let device = DeviceDesign {
+        cells: vec![ff0],
+        nets: vec![
+            DeviceNet::new("rst", NetOrigin::Logical)
+                .with_driver(DeviceEndpoint::port("rst_in", "IN", (1, 0, 0)))
+                .with_sink(DeviceEndpoint::cell("ff0", "RN", (0, 0, 0))),
+        ],
+        ..DeviceDesign::default()
+    };
+
+    let slice = logic_slice_program(&device);
+    assert_eq!(slice.set_reset_mode, SliceSetResetMode::ActiveLowShared);
+
+    let requests = compiled_logic_slice_requests(&device, mini_logic_slice_lut_cil());
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.cfg_name == "SRMUX" && request.function_name == "SR_B")
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.cfg_name == "SRFFMUX" && request.function_name == "0")
+    );
 }
 
 #[test]

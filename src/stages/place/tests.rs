@@ -603,10 +603,13 @@ fn placement_assigns_block_ram_clusters_to_block_ram_sites() -> Result<()> {
     )?
     .value;
 
-    assert_eq!(placed_sites(&placed), vec![("bram0".to_string(), 1, 0, 0)]);
+    assert!(matches!(
+        placed_sites(&placed).as_slice(),
+        [(_, 1, 0, 0)] | [(_, 6, 7, 0)]
+    ));
     assert!(
-        placed.clusters[0].fixed,
-        "block RAM placement should reserve a dedicated site"
+        !placed.clusters[0].fixed,
+        "unconstrained block RAM placement should remain movable during place"
     );
 
     Ok(())

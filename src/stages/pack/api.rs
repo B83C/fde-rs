@@ -1,6 +1,6 @@
 use super::DEFAULT_PACK_CAPACITY;
 use crate::{
-    domain::ClusterKind,
+    domain::{ClusterKind, SequentialCellType},
     ir::{CellId, Cluster, Design, DesignIndex},
     report::{StageOutput, StageReport, StageReporter, emit_stage_info},
 };
@@ -617,9 +617,9 @@ fn lut_rule_rank(type_name: &str) -> u16 {
 }
 
 fn ff_rule_rank(type_name: &str) -> u16 {
-    match type_name {
-        "DFFHQ" => 0,
-        "EDFFHQ" => 1,
+    match SequentialCellType::from_type_name(type_name) {
+        Some(SequentialCellType::DffHq) => 0,
+        Some(SequentialCellType::EdffHq) => 1,
         _ => u16::MAX,
     }
 }

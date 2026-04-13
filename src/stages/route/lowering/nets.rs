@@ -331,6 +331,6 @@ mod tests {
         assert_eq!((dia0.x, dia0.y, dia0.z), (9, 5, 0));
         assert_eq!((clka.x, clka.y, clka.z), (10, 5, 0));
         assert_eq!((do14.x, do14.y, do14.z), (11, 5, 0));
-        assert_eq!((addrb11.x, addrb11.y, addrb11.z), (12, 5, 0));
+        assert_eq!((addrb11.x, addrb11.y, addrb11.z), (10, 5, 0));
     }
 }

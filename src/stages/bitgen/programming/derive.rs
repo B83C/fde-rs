@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use super::types::{
     IobProgram, LutProgram, SequentialProgram, SiteInstance, SiteProgram, SiteProgramKind,
-    SliceClockEnableMode, SliceFfDataPath, SliceLutOutputUsage, SliceProgram,
+    SliceClockEnableMode, SliceFfDataPath, SliceLutOutputUsage, SliceProgram, SliceSetResetMode,
 };
 use crate::{
     bitgen::{DeviceCell, DeviceDesign, DeviceEndpoint},
@@ -107,6 +107,9 @@ fn derive_slice_program(
             if slice_ff_uses_clock_enable(cell, device, index) {
                 program.clock_enable_mode = SliceClockEnableMode::DirectCe;
             }
+            if slice_ff_uses_set_reset(cell, device, index) {
+                program.set_reset_mode = SliceSetResetMode::ActiveLowShared;
+            }
         }
     }
 
@@ -185,6 +188,21 @@ fn slice_ff_data_path(
             SliceFfDataPath::SiteBypass
         }
     }
+}
+
+fn slice_ff_uses_set_reset(
+    cell: &DeviceCell,
+    device: &DeviceDesign,
+    index: &DeviceDesignIndex<'_>,
+) -> bool {
+    device.nets.iter().any(|net| {
+        net.sinks.iter().any(|sink| {
+            matches!(
+                index.resolve_endpoint_ref(device, sink),
+                DeviceEndpointRef::Cell(sink_cell) if sink_cell.cell_name == cell.cell_name
+            ) && cell.primitive_kind().is_set_reset_pin(&sink.pin)
+        })
+    })
 }
 
 fn slice_lut_output_usage(

@@ -1,4 +1,5 @@
 use crate::{
+    domain::ClusterKind,
     ir::ClusterId,
     place::{PlaceMode, PlaceOptions},
     report::{StageReporter, emit_stage_info, emit_stage_progress},
@@ -12,10 +13,10 @@ use super::{
     graph::{ClusterGraph, build_cluster_graph, cluster_incident_criticality},
     model::{PlacementModel, Point},
     support::{
-        CandidateTargets, ClusterUpdates, OccupancyMap, SiteOccupancy, apply_updates_in_place,
-        best_neighbors, candidate_targets, choose_focus, extend_best_sites, initial_placement,
-        nearby_sites, occupancy_map, plan_target_updates, push_unique, random_swap_updates,
-        restore_updates, site_mask,
+        CandidateTargets, ClusterUpdates, OccupancyMap, SiteOccupancy, TargetUpdateContext,
+        apply_updates_in_place, best_neighbors, candidate_targets, choose_focus, extend_best_sites,
+        initial_placement, nearby_sites, occupancy_map, plan_target_updates, push_unique,
+        random_swap_updates, restore_updates, site_mask,
     },
 };
 
@@ -33,8 +34,11 @@ struct SolveContext<'a> {
     graph: &'a ClusterGraph,
     model: &'a PlacementModel,
     criticality: &'a [f64],
-    sites: &'a [Point],
-    site_mask: &'a [bool],
+    logic_sites: &'a [Point],
+    logic_site_mask: &'a [bool],
+    block_ram_sites: &'a [Point],
+    block_ram_site_mask: &'a [bool],
+    logic_site_capacity: usize,
     movable: &'a [ClusterId],
     movable_mask: &'a [bool],
 }
@@ -74,13 +78,21 @@ fn solve_internal(
     reporter: &mut Option<&mut dyn StageReporter>,
     incremental_override: Option<bool>,
 ) -> Result<PlacementSolution> {
-    let sites = options
+    let logic_sites = options
         .arch
         .logic_sites()
         .into_iter()
         .map(Point::from)
         .collect::<Vec<_>>();
-    let site_mask = site_mask(&sites, options.arch.width, options.arch.height);
+    let logic_site_mask = site_mask(&logic_sites, options.arch.width, options.arch.height);
+    let block_ram_sites = options
+        .arch
+        .block_ram_sites()
+        .into_iter()
+        .map(Point::from)
+        .collect::<Vec<_>>();
+    let block_ram_site_mask = site_mask(&block_ram_sites, options.arch.width, options.arch.height);
+    let logic_site_capacity = options.arch.slices_per_tile.max(1);
     let graph = build_cluster_graph(design);
     let model = PlacementModel::from_design(design);
     let criticality = cluster_incident_criticality(design);
@@ -102,11 +114,13 @@ fn solve_internal(
             &graph,
             &model,
             &criticality,
-            &sites,
-            &site_mask,
+            &logic_sites,
+            &logic_site_mask,
+            &block_ram_sites,
+            &block_ram_site_mask,
             options.arch.width,
             options.arch.height,
-            options.arch.slices_per_tile.max(1),
+            logic_site_capacity,
         )?;
         let metrics = evaluate_positions(
             &model,
@@ -128,8 +142,11 @@ fn solve_internal(
         graph: &graph,
         model: &model,
         criticality: &criticality,
-        sites: &sites,
-        site_mask: &site_mask,
+        logic_sites: &logic_sites,
+        logic_site_mask: &logic_site_mask,
+        block_ram_sites: &block_ram_sites,
+        block_ram_site_mask: &block_ram_site_mask,
+        logic_site_capacity,
         movable: &movable,
         movable_mask: &movable_mask,
     };
@@ -196,11 +213,13 @@ fn initial_positions(context: &SolveContext<'_>) -> Result<Vec<Option<Point>>> {
         context.graph,
         context.model,
         context.criticality,
-        context.sites,
-        context.site_mask,
+        context.logic_sites,
+        context.logic_site_mask,
+        context.block_ram_sites,
+        context.block_ram_site_mask,
         context.options.arch.width,
         context.options.arch.height,
-        context.options.arch.slices_per_tile.max(1),
+        context.logic_site_capacity,
     )
 }
 
@@ -234,13 +253,15 @@ fn choose_focus_and_targets(
 ) -> Result<(ClusterId, CandidateTargets)> {
     let focus = choose_focus(focus_weights, rng)
         .ok_or_else(|| anyhow!("missing movable cluster during placement"))?;
+    let (sites, site_mask, _) = site_resources(context, focus);
     let targets = candidate_targets(
         focus,
+        cluster_kind(context, focus),
         context.model,
         context.graph,
         placements,
-        context.sites,
-        context.site_mask,
+        sites,
+        site_mask,
         context.options.arch.width,
         context.options.arch.height,
         rng,
@@ -332,15 +353,20 @@ fn best_incremental_trial(
 ) -> Option<PlacementCandidate> {
     let mut best_updates: Option<ClusterUpdates> = None;
     let mut best_total = f64::INFINITY;
+    let (_, site_mask, site_capacity) = site_resources(context, focus);
     for target in candidates {
         let Some(changes) = plan_target_updates(
-            evaluator.placements(),
-            current_occupancy,
-            context.movable_mask,
+            TargetUpdateContext {
+                placements: evaluator.placements(),
+                occupancy: current_occupancy,
+                movable_mask: context.movable_mask,
+                site_mask,
+                width: context.options.arch.width,
+                height: context.options.arch.height,
+                site_capacity,
+            },
             focus,
             target,
-            context.options.arch.width,
-            context.options.arch.slices_per_tile.max(1),
         ) else {
             continue;
         };
@@ -360,7 +386,12 @@ fn maybe_apply_incremental_swap(
     best: &mut PlacementSolution,
     rng: &mut ChaCha8Rng,
 ) {
-    if let Some(swapped) = random_swap_updates(state.evaluator.placements(), context.movable, rng) {
+    if let Some(swapped) = random_swap_updates(
+        context.design,
+        state.evaluator.placements(),
+        context.movable,
+        rng,
+    ) {
         let swap_metrics = state.evaluator.evaluate_candidate_metrics(&swapped);
         if swap_metrics.total < state.metrics.total {
             let swap_candidate = state.evaluator.evaluate_candidate(&swapped);
@@ -487,15 +518,20 @@ fn best_full_trial(
     candidates: CandidateTargets,
 ) -> Option<(ClusterUpdates, PlacementMetrics)> {
     let mut best_trial: Option<(ClusterUpdates, PlacementMetrics)> = None;
+    let (_, site_mask, site_capacity) = site_resources(context, focus);
     for target in candidates {
         let Some(changes) = plan_target_updates(
-            current,
-            current_occupancy,
-            context.movable_mask,
+            TargetUpdateContext {
+                placements: current,
+                occupancy: current_occupancy,
+                movable_mask: context.movable_mask,
+                site_mask,
+                width: context.options.arch.width,
+                height: context.options.arch.height,
+                site_capacity,
+            },
             focus,
             target,
-            context.options.arch.width,
-            context.options.arch.slices_per_tile.max(1),
         ) else {
             continue;
         };
@@ -525,7 +561,8 @@ fn maybe_apply_full_swap(
     best: &mut PlacementSolution,
     rng: &mut ChaCha8Rng,
 ) {
-    if let Some(swapped) = random_swap_updates(&state.current, context.movable, rng) {
+    if let Some(swapped) = random_swap_updates(context.design, &state.current, context.movable, rng)
+    {
         let backups = apply_updates_in_place(&mut state.trial, &swapped);
         let swap_metrics = evaluate_positions(
             context.model,
@@ -692,15 +729,20 @@ fn refine_solution(
         for &focus in &focus_order {
             let candidates = refinement_targets(context, focus, evaluator.placements());
             let mut best_trial: Option<PlacementCandidate> = None;
+            let (_, site_mask, site_capacity) = site_resources(context, focus);
             for target in candidates {
                 let Some(changes) = plan_target_updates(
-                    evaluator.placements(),
-                    &occupancy,
-                    context.movable_mask,
+                    TargetUpdateContext {
+                        placements: evaluator.placements(),
+                        occupancy: &occupancy,
+                        movable_mask: context.movable_mask,
+                        site_mask,
+                        width: context.options.arch.width,
+                        height: context.options.arch.height,
+                        site_capacity,
+                    },
                     focus,
                     target,
-                    context.options.arch.width,
-                    context.options.arch.slices_per_tile.max(1),
                 ) else {
                     continue;
                 };
@@ -788,10 +830,17 @@ fn refinement_targets(
     let Some(current) = placements.get(focus.index()).copied().flatten() else {
         return targets;
     };
+    let (sites, site_mask, _) = site_resources(context, focus);
     push_unique(&mut targets, current);
+    if cluster_kind(context, focus) == ClusterKind::BlockRam {
+        for site in sites {
+            push_unique(&mut targets, *site);
+        }
+        return targets;
+    }
     for (nearby, _) in nearby_sites(
         current,
-        context.site_mask,
+        site_mask,
         context.options.arch.width,
         context.options.arch.height,
         2,
@@ -800,17 +849,17 @@ fn refinement_targets(
     }
 
     if let Some(centroid) = context.graph.weighted_centroid(focus, placements) {
-        extend_best_sites(centroid, context.sites, 4, &mut targets);
+        extend_best_sites(centroid, sites, 4, &mut targets);
     }
     if let Some(signal_center) = context.model.signal_centroid(focus, placements) {
-        extend_best_sites(signal_center, context.sites, 4, &mut targets);
+        extend_best_sites(signal_center, sites, 4, &mut targets);
     }
     for (neighbor, _) in best_neighbors(context.graph.neighbors(focus), 4) {
         if let Some(point) = placements.get(neighbor.index()).copied().flatten() {
             push_unique(&mut targets, point);
             for (nearby, _) in nearby_sites(
                 point,
-                context.site_mask,
+                site_mask,
                 context.options.arch.width,
                 context.options.arch.height,
                 1,
@@ -840,4 +889,27 @@ fn focus_weights(context: &SolveContext<'_>) -> Vec<(ClusterId, f64)> {
             (*cluster_id, weight.max(0.1))
         })
         .collect()
+}
+
+fn cluster_kind(context: &SolveContext<'_>, cluster_id: ClusterId) -> ClusterKind {
+    context
+        .design
+        .clusters
+        .get(cluster_id.index())
+        .map(|cluster| cluster.kind)
+        .unwrap_or(ClusterKind::Unknown)
+}
+
+fn site_resources<'a>(
+    context: &'a SolveContext<'_>,
+    cluster_id: ClusterId,
+) -> (&'a [Point], &'a [bool], usize) {
+    match cluster_kind(context, cluster_id) {
+        ClusterKind::BlockRam => (context.block_ram_sites, context.block_ram_site_mask, 1),
+        _ => (
+            context.logic_sites,
+            context.logic_site_mask,
+            context.logic_site_capacity,
+        ),
+    }
 }

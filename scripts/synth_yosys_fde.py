@@ -39,6 +39,8 @@ def default_support_dir(root: Path) -> Path | None:
 def required_support_files(support_dir: Path) -> dict[str, Path]:
     files = {
         "fdesimlib": support_dir / "fdesimlib.v",
+        "bram_lib": support_dir / "brams.txt",
+        "bram_map": support_dir / "brams_map.v",
         "techmap": support_dir / "techmap.v",
         "cells_map": support_dir / "cells_map.v",
     }
@@ -64,24 +66,29 @@ def build_yosys_script(
         f"hierarchy -check -top {top_module}",
         "proc",
         "flatten -noscopeinfo",
+        "memory -nomap",
+        "opt_clean",
+        f"memory_libmap -lib {quote_yosys_path(support_files['bram_lib'])}",
+        f"techmap -map {quote_yosys_path(support_files['bram_map'])}",
+        "opt",
         "memory_map",
         "opt -fast",
         "opt -full",
         f"techmap -map {quote_yosys_path(support_files['techmap'])}",
         "simplemap",
         "dfflegalize \\",
-        "  -cell $_DFF_N_ x \\",
-        "  -cell $_DFF_P_ x \\",
-        "  -cell $_DFFE_PP_ x \\",
-        "  -cell $_DFFE_PN_ x \\",
-        "  -cell $_DFF_PN0_ x \\",
-        "  -cell $_DFF_PN1_ x \\",
-        "  -cell $_DFF_PP0_ x \\",
-        "  -cell $_DFF_PP1_ x \\",
-        "  -cell $_DFF_NN0_ x \\",
-        "  -cell $_DFF_NN1_ x \\",
-        "  -cell $_DFF_NP0_ x \\",
-        "  -cell $_DFF_NP1_ x",
+        "  -cell $_DFF_N_ 01 \\",
+        "  -cell $_DFF_P_ 01 \\",
+        "  -cell $_DFFE_PP_ 01 \\",
+        "  -cell $_DFFE_PN_ 01 \\",
+        "  -cell $_DFF_PN0_ r \\",
+        "  -cell $_DFF_PN1_ r \\",
+        "  -cell $_DFF_PP0_ r \\",
+        "  -cell $_DFF_PP1_ r \\",
+        "  -cell $_DFF_NN0_ r \\",
+        "  -cell $_DFF_NN1_ r \\",
+        "  -cell $_DFF_NP0_ r \\",
+        "  -cell $_DFF_NP1_ r",
         f"techmap -D NO_LUT -map {quote_yosys_path(support_files['cells_map'])}",
         "opt",
         "wreduce",
@@ -130,7 +137,7 @@ def run_yosys(yosys_bin: str, script_path: Path, log_path: Path, work_dir: Path)
 def build_parser() -> argparse.ArgumentParser:
     root = repo_root()
     parser = argparse.ArgumentParser(
-        description="Synthesize Verilog to FDE-compatible EDIF using Aspen's Yosys support files."
+        description="Synthesize Verilog to FDE-compatible EDIF using Aspen's Yosys synthesis flow."
     )
     parser.add_argument("sources", nargs="+", help="Input Verilog/SystemVerilog source files.")
     parser.add_argument("--top", required=True, help="Top module name.")
@@ -144,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--support-dir",
         default=str(default_support_dir(root) or ""),
-        help="Directory containing fdesimlib.v, techmap.v, and cells_map.v.",
+        help="Directory containing fdesimlib.v, brams.txt, brams_map.v, techmap.v, and cells_map.v.",
     )
     parser.add_argument(
         "--yosys-bin",

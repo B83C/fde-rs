@@ -198,7 +198,7 @@ impl BlockRamPin {
 
     pub(crate) fn route_target(self) -> Option<BlockRamRouteTarget> {
         Some(BlockRamRouteTarget {
-            wire_name: format!("BRAM_{}", self.route_pin_name()),
+            wire_name: format!("BRAM_{}", self.route_pin_name()?),
             row_offset: self.row_offset()?,
         })
     }
@@ -269,8 +269,8 @@ impl BlockRamPin {
         Self::Control { side, signal }
     }
 
-    fn route_pin_name(self) -> String {
-        match self {
+    fn route_pin_name(self) -> Option<String> {
+        Some(match self {
             Self::Control { side, signal } => match (side, signal) {
                 (BlockRamPortSide::A, BlockRamControlSignal::Clock) => "CLKA".to_string(),
                 (BlockRamPortSide::A, BlockRamControlSignal::WriteEnable) => "WEA".to_string(),
@@ -290,10 +290,10 @@ impl BlockRamPin {
                 BlockRamPortSide::B => format!("DOB{index}"),
             },
             Self::Addr { side, index } => match side {
-                BlockRamPortSide::A => format!("ADDRA{index}"),
-                BlockRamPortSide::B => format!("ADDRB{index}"),
+                BlockRamPortSide::A => format!("ADDRA{}", routed_addr_index(index)?),
+                BlockRamPortSide::B => format!("ADDRB{}", routed_addr_index(index)?),
             },
-        }
+        })
     }
 
     fn row_offset(self) -> Option<isize> {
@@ -306,7 +306,7 @@ impl BlockRamPin {
                 side: BlockRamPortSide::B,
                 ..
             } => Some(-1),
-            Self::Addr { index, .. } => Some((index / 4) as isize - 2),
+            Self::Addr { index, .. } => Some((routed_addr_index(index)? / 4) as isize - 2),
             Self::DataOut { index, .. } => Some(index as isize % 4 - 3),
             Self::DataIn { index, .. } => match index {
                 0 | 2 | 8 | 10 => Some(-3),
@@ -363,6 +363,13 @@ fn dual_port_control_name(side: BlockRamPortSide, signal: BlockRamControlSignal)
     }
 }
 
+fn routed_addr_index(index: usize) -> Option<usize> {
+    // The sibling C++ flow routes logical ADDR[i] pins onto BRAM_ADDRA/B[11-i]
+    // site wires. C++ route XML shows, for example, ADDRA_1 -> BRAM_ADDRA10
+    // and ADDRA_11 -> BRAM_ADDRA0 on the same BRAM instance.
+    (index < 12).then_some(11 - index)
+}
+
 fn matches_any(pin: &str, aliases: &[&str]) -> bool {
     aliases.iter().any(|alias| pin.eq_ignore_ascii_case(alias))
 }
@@ -399,7 +406,9 @@ mod tests {
         let di = route_target("DI").expect("DI target");
         let do0 = route_target("DO").expect("DO target");
         let do14 = route_target("DO14").expect("DO14 target");
+        let addr1 = route_target("ADDR1").expect("ADDR1 target");
         let addr5 = route_target("ADDR5").expect("ADDR5 target");
+        let addr11 = route_target("ADDR11").expect("ADDR11 target");
         let en = route_target("EN").expect("EN target");
 
         assert_eq!(di.wire_name, "BRAM_DIA0");
@@ -410,8 +419,12 @@ mod tests {
         assert_eq!(di0.row_offset, -3);
         assert_eq!(do14.wire_name, "BRAM_DOA14");
         assert_eq!(do14.row_offset, -1);
-        assert_eq!(addr5.wire_name, "BRAM_ADDRA5");
+        assert_eq!(addr1.wire_name, "BRAM_ADDRA10");
+        assert_eq!(addr1.row_offset, 0);
+        assert_eq!(addr5.wire_name, "BRAM_ADDRA6");
         assert_eq!(addr5.row_offset, -1);
+        assert_eq!(addr11.wire_name, "BRAM_ADDRA0");
+        assert_eq!(addr11.row_offset, -2);
         assert_eq!(en.wire_name, "BRAM_SELA");
         assert_eq!(en.row_offset, -2);
     }
@@ -439,8 +452,8 @@ mod tests {
         assert_eq!(dia15.row_offset, 0);
         assert_eq!(dob5.wire_name, "BRAM_DOB5");
         assert_eq!(dob5.row_offset, -2);
-        assert_eq!(addrb0.wire_name, "BRAM_ADDRB0");
-        assert_eq!(addrb0.row_offset, -2);
+        assert_eq!(addrb0.wire_name, "BRAM_ADDRB11");
+        assert_eq!(addrb0.row_offset, 0);
         assert_eq!(enb.wire_name, "BRAM_SELB");
         assert_eq!(enb.row_offset, -1);
     }
