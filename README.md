@@ -333,7 +333,7 @@ sudo cp 99-FDE.rules /etc/udev/rules.d/99-FDE.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger 
 ```
-At this point, the usb device should be discoverable when running programmer. Otherwise, you make debug udev events to check whether the permissions are set correctly:
+At this point, the USB device should be discoverable when running the programmer. Otherwise, you can debug udev events to check whether the permissions are set correctly:
 ```bash
 udevadm monitor --property --udev
 ```
