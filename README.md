@@ -326,7 +326,7 @@ scripts/      synthesis, board, and debug helpers
 - **Readable artifacts for debugging**
 - **Compatibility at the file boundary**
 
-## Running on linux
+## Running on Linux
 To allow userspace access to the usb device, kindly run the following command:
 ```bash
 sudo cp 99-FDE.rules /etc/udev/rules.d/99-FDE.rules
